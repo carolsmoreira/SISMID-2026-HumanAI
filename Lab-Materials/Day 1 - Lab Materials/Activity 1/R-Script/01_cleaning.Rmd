@@ -1,0 +1,221 @@
+---
+title: "Cleaning US Influenza Admissions Data"
+subtitle: "From a raw surveillance CSV to a tidy, forecast-ready table"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # show the code so students can read along
+  message = FALSE,    # hide package startup chatter
+  warning = FALSE     # keep the narrative clean; we validate explicitly below
+)
+```
+
+## What this script does, and why
+
+Before we can *explore* or *model* respiratory data, we need a clean, predictable table to build on. Raw surveillance exports are rarely in the shape we want: they carry columns we don't need, mix geographies together, and store numbers as text.
+
+This document walks through a small cleaning pipeline that takes the CDC weekly Hospital Respiratory Data (HRD) export and produces one tidy file: **one row per week** of **US** influenza admissions, with exactly three columns — `week`, `location`, and `value`. That three-column shape is deliberate: it matches the tidy layout the rest of our modeling and FluSight work expects downstream.
+
+A theme to notice throughout: **we make our assumptions explicit and check them.** Nearly every block below either states what it expects or verifies that it got it. That habit is what turns a script you *hope* works into a script you can *trust*.
+
+## Packages
+
+We only need two packages here. `readr` gives us fast, predictable CSV reading and writing with explicit control over column types. `dplyr` gives us the verbs (`filter`, `transmute`, `arrange`) that make the transformation readable.
+
+```{r packages}
+library(readr)
+library(dplyr)
+```
+
+## Define file paths in one place
+
+We name every file the script touches up front, rather than scattering paths through the code. This gives us a single source of truth: if the data moves or we rename an output, we change it once, here.
+
+Notice the structure of the output paths — `output/data/01_cleaning/...` and `output/figures/01_cleaning/...`. Keeping each script's outputs in a folder named after the script (`01_cleaning`) means results never collide and it's always obvious which step produced which file.
+
+```{r paths}
+input_path  <- "data/Weekly Hospital Respiratory Data (HRD) Metrics by Jurisdiction.csv"
+output_path <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+figure_path <- "output/figures/01_cleaning/epicurve_us_flu_admissions.png"
+```
+
+> **Knitting note:** these are *relative* paths, so they assume your working directory is the project root (the folder that contains `data/`). When you knit an `.Rmd`, R uses the document's own folder as the working directory by default, so if the knit can't find the input file, that's usually the reason.
+
+## Create output folders if they don't exist
+
+A script shouldn't assume its destination folders are already there. `dir.create` with `recursive = TRUE` builds the full folder tree, and `showWarnings = FALSE` keeps it quiet when the folders already exist (which is the normal case on a re-run). `dirname()` just strips the filename off, leaving the folder to create.
+
+```{r make-dirs}
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(figure_path), recursive = TRUE, showWarnings = FALSE)
+```
+
+## Read only the columns we need
+
+The raw export is wide, but we only care about three things: the week, the geography, and the influenza admissions count. `col_select` pulls just those, which is faster and keeps our attention on what matters.
+
+Two deliberate choices are worth calling out:
+
+-   **Read everything as character** (`col_types = cols(.default = col_character())`). It may feel odd to read numbers as text, but it means *we* decide when and how each column becomes a number — instead of letting `readr` guess from the first few rows and occasionally get it wrong on messy surveillance data. We convert on purpose in the next step.
+-   **`any_of(...)` for the admissions column.** Different exports of this dataset spell the column either `Total.Influenza.Admissions` (dots) or `Total Influenza Admissions` (spaces). `any_of()` will grab whichever one is present and silently ignore the other, so the read doesn't break either way.
+
+```{r read-raw}
+raw <- read_csv(
+  input_path,
+  col_select = c(
+    `Week Ending Date`,
+    `Geographic aggregation`,
+    any_of(c("Total.Influenza.Admissions", "Total Influenza Admissions"))
+  ),
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+)
+```
+
+## Figure out which spelling of the column we actually got
+
+We handled *reading* either spelling above; now we need to know which one landed in `raw` so we can refer to it downstream. We check both candidate names against the columns that actually exist and keep the first match.
+
+If neither is present, something is wrong with the input file, and we `stop()` immediately with a clear message rather than failing mysteriously three steps later. **Fail early, fail loudly, and say why** — future-you (or a classmate re-running this) will thank you.
+
+```{r resolve-column}
+# Support both dotted and spaced versions of the influenza admissions column name.
+influenza_col <- c("Total.Influenza.Admissions", "Total Influenza Admissions")
+influenza_col <- influenza_col[influenza_col %in% names(raw)][1]
+
+if (is.na(influenza_col)) {
+  stop("Could not find influenza admissions column in input data.")
+}
+```
+
+## Reshape into the tidy table we want
+
+This is the heart of the script. Reading it as a pipeline, top to bottom:
+
+-   **`filter(...)`** keeps only the national ("USA") rows, dropping every state/territory. This step is why our output is US-only.
+-   **`transmute(...)`** builds a brand-new set of columns and drops everything else (unlike `mutate`, which keeps the originals). We create exactly the three we want:
+    -   `week` — the `Week Ending Date` text turned into a real `Date`, so it sorts and plots correctly as time.
+    -   `location` — hard-coded to `"US"`, a stable label for the national series.
+    -   `value` — the admissions count. `parse_number()` pulls the numeric value out of the character column, tolerating stray commas or symbols. `.data[[...]]` lets us reference the column by the *name we resolved* a moment ago, whichever spelling it turned out to be.
+-   **`arrange(week)`** sorts chronologically, so the series reads left-to-right in time — important for both the checks and the plot that follow.
+
+```{r clean}
+cleaned <- raw %>%
+  filter(`Geographic aggregation` == "USA") %>%
+  transmute(
+    week = as.Date(`Week Ending Date`),
+    location = "US",
+    value = readr::parse_number(.data[[influenza_col]])
+  ) %>%
+  arrange(week)
+```
+
+## Take a look at the cleaned data
+
+Before trusting anything, let's actually *see* what we built. `dim()` reports the shape — how many weeks (rows) and columns we ended up with — and `head()` prints the first several rows so we can eyeball the values. Notice the column types shown under each name: `week` is a `date`, `location` is text (`chr`), and `value` is a number (`dbl`) — exactly the three-column, correctly-typed layout we were aiming for.
+
+```{r peek}
+dim(cleaned)     # number of weeks (rows) and columns
+head(cleaned, 10) # first ten weeks of the cleaned series
+```
+
+## Check that the result is what we promised
+
+Here we verify the cleaned table against a small contract we set for ourselves. `stopifnot()` halts the script the moment any condition is `FALSE`, so a bad result can never quietly slip into the next stage of the pipeline.
+
+Read these as a checklist of everything we're claiming about `cleaned`:
+
+-   there's at least one row (the filter didn't wipe everything out);
+-   the columns are *exactly* `week`, `location`, `value`, in that order;
+-   every row is US;
+-   `week` really is a `Date` and `value` really is numeric;
+-   there are no missing values hiding in `value`.
+
+Writing checks like these is a genuinely useful habit: they're an objective, machine-verifiable definition of "done" that the data has to satisfy before any later step is allowed to build on it.
+
+```{r checks}
+# Acceptance checks from the agent instructions.
+stopifnot(nrow(cleaned) > 0)
+stopifnot(all(names(cleaned) == c("week", "location", "value")))
+stopifnot(all(cleaned$location == "US"))
+stopifnot(inherits(cleaned$week, "Date"))
+stopifnot(is.numeric(cleaned$value))
+stopifnot(!anyNA(cleaned$value))
+```
+
+## Save the cleaned data
+
+With the table validated, we write it out as a CSV — the artifact the next scripts will read. The final `stopifnot(file.exists(...))` confirms the file actually landed on disk, closing the loop on "did this step really succeed?"
+
+```{r write}
+write_csv(cleaned, output_path)
+stopifnot(file.exists(output_path))
+```
+
+## Draw an epicurve as a visual sanity check
+
+Numbers passing checks is one kind of confidence; *seeing* the data is another. A quick epidemic curve (an "epicurve") — admissions plotted over time — instantly reveals whether the series has the seasonal flu shape we'd expect, or whether something looks off.
+
+We'll do two things with this plot: **save a high-resolution copy to disk** (the version the pipeline and any report would use) and **render it inline** so you can see it right here in the knitted document.
+
+First, the saved-to-disk version. A few details in this plotting block:
+
+-   `png(...)` opens a file to draw into, so the chart is **saved to disk** rather than shown inline. `res = 150` gives a crisp image at a readable size.
+-   `par(no.readonly = TRUE)` saves the current graphics settings, and `on.exit(par(op), add = TRUE)` restores them afterward — good manners so this block doesn't leave the plotting device in a weird state.
+-   `barplot(...)` draws one bar per week. `space = 0` and `border = NA` pack the bars into a continuous curve; `las = 2` rotates the date labels vertical and `cex.names = 0.5` shrinks them so many weeks fit without overlapping.
+-   `dev.off()` closes the file (this is what actually finishes writing the PNG), and the final check confirms the figure exists.
+
+```{r epicurve}
+png(filename = figure_path, width = 1400, height = 800, res = 150)
+op <- par(no.readonly = TRUE)
+on.exit(par(op), add = TRUE)
+
+plot_values <- as.numeric(cleaned$value)
+
+barplot(
+  height = plot_values,
+  names.arg = format(cleaned$week, "%Y-%m-%d"),
+  space = 0,
+  border = NA,
+  col = "#1f78b4",
+  las = 2,
+  cex.names = 0.5,
+  main = "US Weekly Influenza Admissions Epicurve",
+  xlab = "Week Ending Date",
+  ylab = "Admissions"
+)
+
+dev.off()
+stopifnot(file.exists(figure_path))
+```
+
+### The same curve, rendered inline
+
+Here we draw the epicurve straight into the document. There's no `png()` around it, so R Markdown catches the plot and embeds it in the knitted output. The chunk options `fig.width` and `fig.height` control its size on the page, and `fig.cap` adds a caption underneath.
+
+We can reuse `plot_values` from the block above, since chunks in a knitted document share one environment and run top to bottom. (If you find yourself copying the `barplot()` call around a lot, that's a good nudge to wrap it in a small helper function and call it in both places — the classic "don't repeat yourself" move.)
+
+```{r epicurve-inline, fig.width=12, fig.height=6, fig.cap="US weekly influenza admissions."}
+barplot(
+  height = plot_values,
+  names.arg = format(cleaned$week, "%Y-%m-%d"),
+  space = 0,
+  border = NA,
+  col = "#1f78b4",
+  las = 2,
+  cex.names = 0.5,
+  main = "US Weekly Influenza Admissions Epicurve",
+  xlab = "Week Ending Date",
+  ylab = "Admissions"
+)
+```
+
+## Where this leads
+
+We now have a small, trustworthy file — `cleaned_flu_admissions.csv` — plus a picture of the series. That clean table is the foundation for the next steps: exploring the data more deeply and, from there, fitting forecasting models. Every minute spent making this step reliable pays off in every step that builds on it.
