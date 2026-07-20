@@ -1,0 +1,544 @@
+---
+title: "Forecasting US Influenza Admissions"
+subtitle: "Expanding-window ARIMA forecasts in FluSight quantile format"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # show the code so students can read along
+  message = FALSE,    # hide package startup chatter
+  warning = FALSE     # keep the narrative clean; we validate explicitly below
+)
+```
+
+## What this script does, and why
+
+The first two steps of the pipeline cleaned the data and explored it. This is where we finally *forecast*: for each week of the 2025-26 season, we predict how many influenza hospitalizations the next one, two, and three weeks will bring — and we express each prediction not as a single number but as a full set of **quantiles**, the honest way to say "here's our best guess, and here's how uncertain we are."
+
+Concretely, the script walks a set of **reference dates** through the testing season. At each one it fits a model to *only the data available up to that point* (an "expanding window," so we never peek at the future), forecasts three horizons ahead, and writes the result in **FluSight long format** — the tidy layout the CDC's FluSight hub and the hubverse tools expect. It closes by drawing the forecasts on top of what was actually observed, so we can see at a glance whether the model tracked reality.
+
+Two themes carry over from the earlier steps, and one is new. As before, **we validate relentlessly**: nearly every block asserts something about its inputs or outputs and stops loudly if it's wrong. The new theme is **no look-ahead leakage** — the single most important correctness property of any forecast. A model that accidentally trains on the very weeks it's supposed to predict looks brilliant and is worthless. Much of the ceremony below exists to guarantee that never happens. The section banners (`Rule 1`, `Rule 2`, …) mirror the project's `rules.md` spec, which is the authoritative description of what each step must do.
+
+## Packages
+
+We need seven packages. `readr`, `dplyr`, `lubridate`, `ggplot2`, and `MMWRweek` are all familiar from the earlier steps. Two are new: `tidyr` gives us `pivot_wider()` for reshaping quantiles between long and wide layouts during validation, and `forecast` provides the modeling engine — `auto.arima()` to fit and `forecast()` to project ahead with prediction intervals.
+
+As in step 02, the loop **installs anything missing** before loading it, so the script runs on a clean machine. Wrapping the `library()` calls in `suppressPackageStartupMessages()` keeps the console tidy — `forecast` in particular is chatty on load.
+
+```{r packages}
+pkgs <- c("readr", "dplyr", "tidyr", "lubridate", "ggplot2", "MMWRweek", "forecast")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(ggplot2)
+  library(MMWRweek)
+  library(forecast)
+})
+```
+
+## Define file paths and prepare output folders
+
+The usual single-source-of-truth setup: one input (the cleaned CSV from step 01) and two outputs (the forecast CSV and the diagnostic figure), all under this script's own `03_forecast` folder. We build the destination folders if they're missing, then confirm the input exists before doing anything else — failing here, at the door, is far friendlier than failing halfway through a fit.
+
+```{r paths}
+cleaned_csv   <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+forecast_csv  <- "output/data/03_forecast/flusight_forecasts.csv"
+forecast_png  <- "output/figures/03_forecast/forecast_vs_observed.png"
+
+dir.create(dirname(forecast_csv), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(forecast_png), recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(cleaned_csv)) stop(paste0("Missing input: ", cleaned_csv))
+```
+
+## Read and validate the input (Rule 1)
+
+We read every column as character and then parse each one deliberately, exactly as the earlier steps did — we'd rather control the conversion than let `readr` guess. After confirming the three expected columns are present, we parse in turn:
+
+-   **`week` → `Date`**, trying ISO (`as.Date`), then `ymd`, then `mdy`.
+-   **`value` → numeric**, via `parse_number()` (which tolerates commas).
+-   **`location`**, which must be entirely `"US"`.
+
+One difference from the exploratory step is worth calling out: these checks are *stricter*. Here we stop if **any** value fails to parse (`any(is.na(...))`), not only if the whole column does. A forecasting input has to be complete — a single unparseable week would leave a hole in the series that the evenly-spaced-weeks check downstream would (rightly) reject. The error messages follow the `rules.md` convention verbatim — `"The {column} could not be parsed."` — so a failure here reads the same way the spec describes it.
+
+```{r read-validate}
+df <- read_csv(cleaned_csv, col_types = cols(.default = "c"))
+
+if (!all(c("week", "location", "value") %in% names(df))) {
+  stop("Required columns missing from cleaned CSV (expected week, location, value)")
+}
+
+# week -> Date
+parsed_week <- suppressWarnings({
+  w <- as.Date(df$week)
+  if (all(is.na(w))) w <- ymd(df$week)
+  if (all(is.na(w))) w <- mdy(df$week)
+  w
+})
+if (all(is.na(parsed_week)) || any(is.na(parsed_week))) stop("The week could not be parsed.")
+df$week <- parsed_week
+
+# value -> numeric (handles comma formatting)
+parsed_value <- suppressWarnings(parse_number(df$value))
+if (all(is.na(parsed_value)) || any(is.na(parsed_value))) stop("The value could not be parsed.")
+df$value <- as.numeric(parsed_value)
+
+# location -> character, all "US"
+df$location <- as.character(df$location)
+if (!all(df$location == "US")) stop("The location could not be parsed.")
+
+df <- df %>% select(week, location, value) %>% arrange(week)
+if (nrow(df) == 0) stop("Input has zero rows")
+```
+
+## Assign each week to a flu season (Rule 2)
+
+This is the same season logic developed in the exploration step, brought along because forecasting needs to know which weeks make up the 2025-26 *testing* season. A US influenza season runs from MMWR week 40 through week 20 of the following year, and is named `YYYY-YY`.
+
+We resolve the season's start and end to real calendar dates with the same `first_date_with_mmwr()` helper (scan a year's days, return the first date whose MMWR week matches the target), then tag every observed week with the season it belongs to. As in the revised exploration script, attribution is based on the **calendar year** of the date — with the early-January / week-53 edge case handled so a winter season stays continuous across the New Year: a high epiweek (≥ 40) landing in January–August is pulled back to the previous year's season.
+
+```{r seasons}
+current_season_label <- "2025-26"
+current_start_year   <- 2025
+
+first_date_with_mmwr <- function(year, target_week) {
+  dates <- seq.Date(as.Date(paste0(year, "-01-01")),
+                    as.Date(paste0(year, "-12-31")), by = "day")
+  m <- MMWRweek(dates)
+  idx <- which(m$MMWRweek == target_week & m$MMWRyear == year)
+  if (length(idx) == 0) return(as.Date(NA))
+  dates[min(idx)]
+}
+
+season_start <- first_date_with_mmwr(current_start_year, 40)
+season_end   <- first_date_with_mmwr(current_start_year + 1, 20)
+if (is.na(season_start) || is.na(season_end)) {
+  stop("Could not determine 2025-26 season boundaries via MMWRweek")
+}
+
+cat("Season Start Week:", format(season_start, "%Y-%m-%d"), "\n")
+cat("Season End Week:",   format(season_end,   "%Y-%m-%d"), "\n")
+
+mmwr_info      <- MMWRweek(df$week)
+df$epiweek     <- mmwr_info$MMWRweek
+df$cal_year    <- year(df$week)
+df$cal_month   <- month(df$week)
+
+assign_start_year <- function(epiweek, cal_year, cal_month) {
+  if (epiweek >= 40) {
+    if (cal_month >= 1 && cal_month <= 8) cal_year - 1 else cal_year
+  } else if (epiweek <= 20) {
+    cal_year - 1
+  } else {
+    NA_integer_
+  }
+}
+
+df$season_start_year <- mapply(assign_start_year, df$epiweek, df$cal_year, df$cal_month)
+df$season_label <- ifelse(
+  is.na(df$season_start_year), NA_character_,
+  paste0(df$season_start_year, "-", substr(as.character(df$season_start_year + 1), 3, 4))
+)
+```
+
+## Define the training and testing periods (Rule 3)
+
+This block sets up the backbone of the whole exercise, so it's worth reading slowly. A few terms from the FluSight vocabulary make it click:
+
+-   A **reference date** is the week from which we forecast — the "today" of a given forecast. Everything up to and including it is fair game for training; nothing after it may be used.
+-   A **horizon** is how many weeks ahead we're predicting (1, 2, or 3).
+-   A **target end date** is the week a forecast is *about*: `reference_date + 7 * horizon`.
+
+With that vocabulary, the rules here are:
+
+-   **Testing period** is the 2025-26 season only. If none of its weeks are present, we stop.
+-   **Reference dates** are every observed week `r` whose one-week-ahead target (`r + 7`) both *exists in the data* and *falls inside the testing season*. That second condition is what pins forecasting to the season we're actually evaluating; the first guarantees there's a real observation to compare against later.
+-   **Training period** begins at the very first observed week. The "initial" training window ends at the last week *before* the testing season starts — though, as the next section shows, the window then *expands* one reference date at a time.
+
+The loop at the end prints, for every reference date, its three target dates. That printout is a human-readable audit trail: you can eyeball it and confirm the dates line up the way the spec promises before a single model is fit.
+
+```{r train-test}
+# Testing period: the 2025-26 season only.
+test_weeks <- df %>% filter(season_label == current_season_label) %>% arrange(week)
+if (nrow(test_weeks) == 0) stop("No 2025-26 testing-season weeks present in the input")
+first_test_week <- min(test_weeks$week)
+
+# Reference dates: every observed week r whose 1-week-ahead target (r + 7) is
+# present in the data AND falls within the testing (2025-26) season.
+observed_weeks   <- sort(unique(df$week))
+test_week_set    <- test_weeks$week
+is_ref <- vapply(observed_weeks, function(r) {
+  (r + 7) %in% observed_weeks && (r + 7) %in% test_week_set
+}, logical(1))
+reference_dates <- observed_weeks[is_ref]
+if (length(reference_dates) == 0) stop("No valid reference dates for the testing period")
+
+# Training period: all observed weeks strictly before the first testing week.
+train_start <- min(df$week)
+initial_train_end <- max(df$week[df$week < first_test_week])
+
+cat("\n--- Rule 3 validations ---\n")
+cat("[val] Training Period start:", format(train_start, "%Y-%m-%d"), "\n")
+cat("[val] Initial training window end (last pre-test week):",
+    format(initial_train_end, "%Y-%m-%d"), "\n")
+cat("[val] Testing Period start:", format(first_test_week, "%Y-%m-%d"), "\n")
+cat("[val] Forecast horizons: 1, 2, 3\n")
+cat("[val] Rolling-window reference (end) dates & their 3 target dates:\n")
+for (r in reference_dates) {
+  rd <- as.Date(r, origin = "1970-01-01")
+  tg <- rd + 7 * (1:3)
+  cat("   ref", format(rd, "%Y-%m-%d"),
+      "-> targets", paste(format(tg, "%Y-%m-%d"), collapse = ", "), "\n")
+}
+```
+
+## Set up the quantile ladder (Rule 5)
+
+FluSight doesn't want a single predicted number; it wants a **distribution**, expressed as 23 quantiles running from the 1st percentile to the 99th. This block builds the scaffolding for that.
+
+The trick is that `forecast()` gives us *central prediction intervals* (an 80% interval, a 95% interval, and so on), while FluSight wants *quantiles*. The two are just different views of the same thing: a central `L`% interval is bounded by the `(0.5 − L/200)` and `(0.5 + L/200)` quantiles. So a 95% interval hands us the 0.025 and 0.975 quantiles, a 90% interval the 0.05 and 0.95, and so on.
+
+-   **`LEVELS`** lists the eleven central coverage levels we'll ask `forecast()` for.
+-   **`level_map`** records, for each level, which lower-tail and upper-tail quantile its interval corresponds to.
+-   **`quantile_ladder`** is the full set of 23 quantiles in ascending order — the eleven tail-pairs plus the median (0.5) in the middle.
+
+```{r quantile-ladder}
+LEVELS <- c(98, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10)
+
+# Each central coverage level maps to a lower-tail and upper-tail quantile.
+level_map <- data.frame(
+  level = LEVELS,
+  lo_q  = c(0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45),
+  hi_q  = c(0.99, 0.975, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55),
+  stringsAsFactors = FALSE
+)
+
+# The full FluSight quantile ladder, in ascending order (23 values).
+quantile_ladder <- c(0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35,
+                     0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80,
+                     0.85, 0.90, 0.95, 0.975, 0.99)
+```
+
+## Fit, forecast, and reshape (Rules 4 & 5)
+
+This is the engine room. We iterate over the reference dates, and at each one:
+
+-   **Build the expanding window.** `train <- df %>% filter(week <= rd)` keeps every observation up to and including the reference date — and, crucially, *nothing after it*. This one line is what enforces no look-ahead leakage.
+-   **Validate the training window (Rule 4)** before trusting it: the weeks must be sorted, unique, and evenly spaced 7 days apart (a gap means a missing week); the response must be numeric, non-`NA`, non-negative, and not perfectly constant (a flat series has nothing for ARIMA to model).
+-   **Fit once, forecast three horizons.** `auto.arima(y)` searches for a reasonable ARIMA specification automatically. We fit a single model per reference date and reuse it for all three horizons — `forecast(fit, h = 3, level = LEVELS)` returns point forecasts *and* every requested interval in one shot.
+-   **Assemble the 23 quantiles.** The point forecast is the median (`0.5`). For each coverage level we locate the matching interval column *by its level value* (not by position — safer if the ordering ever shifts) and drop its lower and upper bounds into the right quantile slots. We then order everything by the canonical ladder and check the whole vector is finite.
+-   **Keep a raw copy, then clamp and round.** We stash the *pre-clamp* quantiles for the symmetry check later, then produce the emitted values with `round(pmax(raw_vec, 0))` — hospitalizations can't be negative or fractional, so we floor at zero and round to whole counts.
+-   **Emit FluSight long rows**, one per quantile per horizon, carrying the fixed metadata (`target = "wk inc flu hosp"`, `location = "US"`, `output_type = "quantile"`).
+
+> **Why keep a raw copy?** Clamping at zero is the right thing for the numbers we *publish*, but it can break the neat symmetry of the prediction intervals when a lower bound gets pushed up to 0. The validation step checks symmetry on the *raw* forecast, where it should hold exactly, and checks non-negativity and integer-ness on the *clamped* forecast. Each property is tested on the version of the data where it actually applies.
+
+> **On `auto.arima` and seasonality:** called on a bare numeric vector with no frequency information, `auto.arima()` fits a *non-seasonal* model. That's a deliberate, accepted simplification for this baseline — a clean, correct starting point that later, richer models can be measured against.
+
+```{r fit-forecast}
+cat("\n--- Rule 4 & 5 validations ---\n")
+
+all_rows  <- list()
+raw_rows  <- list()   # pre-clamp values, for symmetry checks
+row_i <- 0
+raw_i <- 0
+
+for (r in reference_dates) {
+  rd <- as.Date(r, origin = "1970-01-01")
+
+  # Expanding window: all observed weeks with week <= reference_date.
+  train <- df %>% filter(week <= rd) %>% arrange(week)
+
+  # Rule 4 validations on the training window.
+  wk <- train$week
+  if (is.unsorted(wk)) stop(paste0("Training window not sorted ascending at ref ", format(rd, "%Y-%m-%d")))
+  if (any(duplicated(wk))) stop(paste0("Duplicate weeks in training window at ref ", format(rd, "%Y-%m-%d")))
+  gaps <- as.numeric(diff(wk))
+  if (length(gaps) > 0 && any(gaps != 7)) {
+    stop(paste0("Training weeks not evenly spaced (7-day) at ref ", format(rd, "%Y-%m-%d")))
+  }
+
+  y <- train$value
+  if (!is.numeric(y)) stop("Response vector is not numeric")
+  if (any(is.na(y)))  stop("Response vector contains NA")
+  if (any(y < 0))     stop("Response vector contains negative values")
+  if (length(unique(y)) <= 1) stop(paste0("Series is constant at ref ", format(rd, "%Y-%m-%d")))
+
+  # Fit exactly once; reuse for all three horizons.
+  fit <- auto.arima(y)
+  if (is.null(fit)) stop(paste0("auto.arima() returned NULL at ref ", format(rd, "%Y-%m-%d")))
+  ord <- forecast::arimaorder(fit)  # named c(p, d, q) for non-seasonal
+
+  cat("[val] ref", format(rd, "%Y-%m-%d"),
+      "| sorted+unique+evenly-spaced OK | n =", length(y),
+      "| numeric/non-neg/no-NA OK | non-constant OK",
+      "| ARIMA(", ord["p"], ",", ord["d"], ",", ord["q"], ") | fit OK\n")
+
+  fc <- forecast(fit, h = 3, level = LEVELS)
+
+  # For each horizon assemble the 23 raw (pre-clamp) quantiles.
+  for (h in 1:3) {
+    target_end <- rd + 7 * h
+
+    raw_q <- setNames(numeric(0), character(0))
+    med   <- as.numeric(fc$mean[h])
+    raw_q["0.5"] <- med
+
+    for (k in seq_len(nrow(level_map))) {
+      L   <- level_map$level[k]
+      col <- which(abs(fc$level - L) < 1e-6)  # index by level value, not input order
+      if (length(col) != 1) stop(paste0("Could not locate forecast column for level ", L))
+      raw_q[as.character(level_map$lo_q[k])] <- as.numeric(fc$lower[h, col])
+      raw_q[as.character(level_map$hi_q[k])] <- as.numeric(fc$upper[h, col])
+    }
+
+    # Order by the canonical ladder.
+    raw_vec <- raw_q[as.character(quantile_ladder)]
+    if (any(!is.finite(raw_vec))) {
+      stop(paste0("Non-finite forecast at ref ", format(rd, "%Y-%m-%d"), " horizon ", h))
+    }
+
+    # Store raw (pre-clamp) rows for symmetry validation.
+    for (qi in seq_along(quantile_ladder)) {
+      raw_i <- raw_i + 1
+      raw_rows[[raw_i]] <- data.frame(
+        reference_date = rd, horizon = h,
+        output_type_id = quantile_ladder[qi], raw_value = as.numeric(raw_vec[qi]),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # Clamp at 0 and round to nearest integer for the emitted counts.
+    emit_vec <- round(pmax(raw_vec, 0))
+
+    for (qi in seq_along(quantile_ladder)) {
+      row_i <- row_i + 1
+      all_rows[[row_i]] <- data.frame(
+        reference_date  = rd,
+        target          = "wk inc flu hosp",
+        horizon         = h,
+        target_end_date = target_end,
+        location        = "US",
+        output_type     = "quantile",
+        output_type_id  = quantile_ladder[qi],
+        value           = as.numeric(emit_vec[qi]),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+forecasts <- bind_rows(all_rows)
+raw_all   <- bind_rows(raw_rows)
+```
+
+## Check the forecasts before trusting them (Rule 5)
+
+With every forecast assembled, we run a checklist over the whole table. Each of these is a property the FluSight format *requires*, and any failure halts the script so a malformed file can never be written:
+
+-   **Non-negative integers** — emitted counts must be whole and ≥ 0.
+-   **Non-decreasing quantiles** — within each reference-date/horizon, walking up the ladder must never make the value go down (a higher quantile can't predict fewer admissions than a lower one).
+-   **Complete quantile set** — exactly the 23 required levels appear per reference-date/horizon, with none missing, extra, or duplicated.
+-   **One fit, three horizons** — each reference date emits exactly horizons 1, 2, and 3.
+-   **Correct target dates** — every `target_end_date` equals `reference_date + 7 * horizon`.
+-   **Intervals widen with horizon** — the 95% interval for the 3-week forecast is at least as wide as the 2-week, which is at least as wide as the 1-week. Uncertainty should grow the further out we look.
+-   **Median centered and symmetric** — checked on the *raw* forecast, where the ARIMA intervals are symmetric about the median by construction. This is the check the raw copy was saved for.
+
+```{r validate-output}
+cat("\n--- Rule 5 output validations ---\n")
+
+# Non-negative integers.
+if (any(forecasts$value < 0) || any(forecasts$value != round(forecasts$value))) {
+  stop("value entries must be non-negative integers")
+}
+
+# Quantiles non-decreasing across the ladder within each ref/horizon.
+nd_ok <- forecasts %>%
+  arrange(reference_date, horizon, output_type_id) %>%
+  group_by(reference_date, horizon) %>%
+  summarise(ok = all(diff(value) >= 0), .groups = "drop")
+if (!all(nd_ok$ok)) stop("Quantile ladder is not non-decreasing somewhere")
+cat("[val] quantiles non-decreasing: OK\n")
+
+# Exactly the 23 required quantile levels, no missing/extra/dup, per ref/horizon.
+lvl_ok <- forecasts %>%
+  group_by(reference_date, horizon) %>%
+  summarise(ok = setequal(output_type_id, quantile_ladder) &&
+                 length(output_type_id) == length(quantile_ladder),
+            .groups = "drop")
+if (!all(lvl_ok$ok)) stop("Quantile level set mismatch (missing/extra/duplicate)")
+cat("[val] all quantile levels present: OK\n")
+
+# One fit -> three horizons: exactly horizons {1,2,3} per reference date.
+h_ok <- forecasts %>%
+  group_by(reference_date) %>%
+  summarise(ok = setequal(unique(horizon), c(1, 2, 3)), .groups = "drop")
+if (!all(h_ok$ok)) stop("Each reference date must emit exactly horizons 1, 2, 3")
+cat("[val] one fit, three horizons: OK\n")
+
+# target_end_date == reference_date + 7 * horizon.
+if (any(forecasts$target_end_date != forecasts$reference_date + 7 * forecasts$horizon)) {
+  stop("target_end_date does not equal reference_date + 7 * horizon")
+}
+cat("[val] target dates correct: OK\n")
+
+# Intervals widen (or hold) with horizon: 95% PI width h3 >= h2 >= h1.
+width_tbl <- forecasts %>%
+  filter(output_type_id %in% c(0.025, 0.975)) %>%
+  select(reference_date, horizon, output_type_id, value) %>%
+  pivot_wider(names_from = output_type_id, values_from = value) %>%
+  mutate(w = `0.975` - `0.025`) %>%
+  select(reference_date, horizon, w) %>%
+  pivot_wider(names_from = horizon, values_from = w, names_prefix = "h")
+if (any(width_tbl$h3 < width_tbl$h2) || any(width_tbl$h2 < width_tbl$h1)) {
+  stop("95% PI width does not satisfy h3 >= h2 >= h1")
+}
+cat("[val] intervals widen with horizon: OK\n")
+
+# Median centered & symmetric pairs equidistant, computed on RAW forecast.
+sym_tol <- 1e-6
+raw_wide <- raw_all %>%
+  pivot_wider(names_from = output_type_id, values_from = raw_value)
+med_centered <- TRUE
+sym_ok <- TRUE
+for (i in seq_len(nrow(raw_wide))) {
+  med <- raw_wide[["0.5"]][i]
+  for (k in seq_len(nrow(level_map))) {
+    lo <- raw_wide[[as.character(level_map$lo_q[k])]][i]
+    hi <- raw_wide[[as.character(level_map$hi_q[k])]][i]
+    if (abs((med - lo) - (hi - med)) > sym_tol * max(1, abs(med))) sym_ok <- FALSE
+  }
+}
+if (!med_centered || !sym_ok) stop("Median not centered / quantiles not symmetric on raw forecast")
+cat("[val] median centered, quantiles symmetric: OK\n")
+```
+
+## Write the FluSight forecast file
+
+With every check passed, we sort the table into a stable order — by reference date, then horizon, then up the quantile ladder — select the eight canonical FluSight columns, and write it out. The final confirmation reports the row count: with 23 quantiles across 3 horizons, each reference date contributes exactly 69 rows.
+
+```{r write-forecasts}
+forecasts_out <- forecasts %>%
+  arrange(reference_date, horizon,
+          match(output_type_id, quantile_ladder)) %>%
+  select(reference_date, target, horizon, target_end_date,
+         location, output_type, output_type_id, value)
+
+write_csv(forecasts_out, forecast_csv)
+if (!file.exists(forecast_csv)) stop("Forecast CSV not written")
+cat("\nWrote", nrow(forecasts_out), "rows to", forecast_csv,
+    "(", length(reference_dates), "reference dates x 69 rows )\n")
+```
+
+## Plot forecasts against what actually happened (Rule 6)
+
+Passing validations proves the file is *well-formed*; the plot shows whether the forecasts are any *good*. We draw the observed series across the testing window, then overlay each horizon's median forecast and its 95% prediction interval, so the eye can judge how closely the predictions tracked reality and how honest the uncertainty bands were.
+
+Reading the layers:
+
+-   **Ribbons first** (`geom_ribbon`), one translucent band per horizon, drawn behind everything so the lines stay legible on top.
+-   **Observed series** as a solid black line with points — the ground truth.
+-   **Forecast medians** as a colored line-and-points per horizon (1/2/3 weeks ahead).
+-   **Manual color and fill scales** keep the horizon colors consistent between the median lines and their ribbons, and give the legend readable labels.
+-   **Axes**: the x-axis steps weekly and labels every fourth date, tilted 45° so they don't collide; the y-axis runs from zero to a little above the largest plotted value.
+
+As in the earlier steps, we save a high-resolution copy to disk and also print the plot object so it renders inline here.
+
+```{r forecast-plot, fig.width=11, fig.height=6.5, fig.cap="Observed US influenza hospitalizations with 1/2/3-week-ahead forecast medians and 95% prediction intervals, 2025-26 season."}
+# Observed: from the first reference date onward through the last observed
+# testing week (the plotted forecast window).
+plot_start <- min(reference_dates)
+observed_plot <- df %>%
+  filter(week >= plot_start) %>%
+  select(week, value) %>%
+  arrange(week)
+
+horizon_levels  <- c("1 wk", "2 wk", "3 wk")
+horizon_colors  <- c("1 wk" = "#0072B2", "2 wk" = "#E69F00", "3 wk" = "#009E73")
+
+# Median line + points per horizon.
+med_df <- forecasts %>%
+  filter(output_type_id == 0.5) %>%
+  transmute(target_end_date, horizon,
+            hlab = factor(paste0(horizon, " wk"), levels = horizon_levels),
+            value)
+
+# 95% PI ribbon per horizon.
+pi_df <- forecasts %>%
+  filter(output_type_id %in% c(0.025, 0.975)) %>%
+  select(target_end_date, horizon, output_type_id, value) %>%
+  pivot_wider(names_from = output_type_id, values_from = value) %>%
+  transmute(target_end_date, horizon,
+            hlab = factor(paste0(horizon, " wk"), levels = horizon_levels),
+            lo = `0.025`, hi = `0.975`)
+
+# Y axis: 0 to (max plotted value + 10000).
+y_max <- max(c(observed_plot$value, med_df$value, pi_df$hi), na.rm = TRUE) + 10000
+
+# X axis: weekly dates from first plotted week to last target_end_date; label
+# every 4th, tilted 45 degrees.
+x_min <- min(observed_plot$week)
+x_max <- max(med_df$target_end_date)
+all_x <- seq.Date(x_min, x_max, by = 7)
+x_breaks <- all_x[seq(1, length(all_x), by = 4)]
+
+p <- ggplot() +
+  # Ribbons behind everything.
+  geom_ribbon(data = pi_df,
+              aes(x = target_end_date, ymin = lo, ymax = hi,
+                  fill = hlab, group = hlab),
+              alpha = 0.20) +
+  # Observed solid black line + points.
+  geom_line(data = observed_plot, aes(x = week, y = value, color = "Observed"),
+            linewidth = 0.9) +
+  geom_point(data = observed_plot, aes(x = week, y = value, color = "Observed"),
+             size = 1.6) +
+  # Forecast median line + points per horizon.
+  geom_line(data = med_df, aes(x = target_end_date, y = value, color = hlab, group = hlab),
+            linewidth = 0.9) +
+  geom_point(data = med_df, aes(x = target_end_date, y = value, color = hlab),
+             size = 1.6) +
+  scale_color_manual(
+    name = "Series",
+    values = c("Observed" = "black", horizon_colors),
+    breaks = c("Observed", horizon_levels),
+    labels = c("Observed", "1 wk Forecast Median",
+               "2 wk Forecast Median", "3 wk Forecast Median")
+  ) +
+  scale_fill_manual(
+    name = "95% PI",
+    values = horizon_colors,
+    labels = c("1 wk 95% PI", "2 wk 95% PI", "3 wk 95% PI")
+  ) +
+  scale_x_date(breaks = x_breaks, date_labels = "%Y-%m-%d") +
+  coord_cartesian(ylim = c(0, y_max)) +
+  labs(
+    x = "Week",
+    y = "Weekly Influenza Hospitalizations",
+    title = "USA 1-, 2-, & 3-Week-Ahead Influenza Hospitalization Forecast (2025-26 Season)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(forecast_png, p, dpi = 300, width = 11, height = 6.5)
+p
+```
+
+## Where this leads
+
+We now have two artifacts: `flusight_forecasts.csv`, a fully validated set of quantile forecasts in exactly the format the FluSight hub ingests, and a figure showing those forecasts against reality. The heavy investment in checks — no look-ahead leakage, complete and ordered quantiles, honest widening uncertainty — is what lets these forecasts be *submitted* and *scored* rather than merely admired. The natural next step is evaluation: comparing these quantiles to the observed target weeks with proper scoring rules (like the weighted interval score) and coverage checks, to ask not just "did the file validate?" but "how good was the forecast?"

@@ -1,0 +1,432 @@
+---
+title: "Activity 2: Exploring US Influenza Admissions Data"
+subtitle: "From a clean table to season windows, trend plots, and a peak summary"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # show the code so students can read along
+  message = FALSE,    # hide package startup chatter
+  warning = FALSE     # keep the narrative clean; we validate explicitly below
+)
+
+# Knit from the project root, wherever this .Rmd happens to live.
+# When you knit an .Rmd, R uses the document's own folder as the working
+# directory -- so relative paths like "output/data/..." would break if this
+# file sits in a subfolder (e.g. scripts/). We walk up from the document's
+# folder until we reach the project root (the folder containing data/ or
+# output/) and knit from there.
+local({
+  root <- normalizePath(".", winslash = "/", mustWork = FALSE)
+  while (!dir.exists(file.path(root, "data")) &&
+         !dir.exists(file.path(root, "output")) &&
+         dirname(root) != root) {
+    root <- dirname(root)
+  }
+  knitr::opts_knit$set(root.dir = root)
+})
+```
+
+## What this script does, and why
+
+The previous step handed us a small, trustworthy table: one row per week of US influenza admissions, with `week`, `location`, and `value`. Now we get to *explore* it — the stage where we look at the data closely enough to understand its shape before anyone tries to model it.
+
+This document does four things with that clean file. It **re-validates** the input (a script should never blindly trust what it's handed, even from a script we wrote ourselves). It **works out the flu-season window** — the stretch of the calendar epidemiologists treat as "the season" — using the CDC's standard week numbering. It **draws two plots**: a national trend over all time, and a seasonal overlay that lines every season up on a common timeline so they can be compared directly. And finally it **summarises the current season's peak** into a tiny table the next steps can read.
+
+The same theme from the cleaning step runs through here: **state your assumptions and check them.** You'll see the script re-assert the three-column contract, try several date formats before giving up, and stop loudly the moment anything looks wrong. That discipline is what lets the plots and the peak summary be trusted rather than merely hoped-for.
+
+## Packages
+
+We need six packages here. `readr` and `dplyr` are familiar from cleaning — reading CSVs and wrangling with verbs. `lubridate` adds forgiving date parsers (`ymd`, `mdy`) for when a plain `as.Date` isn't enough. `ggplot2` is our plotting workhorse for both figures, and `RColorBrewer` supplies the colour palette for the seasonal overlay. And `MMWRweek` translates calendar dates into **MMWR weeks** — the CDC's standard epidemiological week numbering — which is how we'll define seasons.
+
+Unlike the cleaning script, this one **installs anything that's missing** before loading it. The loop checks each package with `requireNamespace()` and only calls `install.packages()` when it isn't already available, so the script can run start-to-finish on a fresh machine without you setting anything up by hand.
+
+```{r packages}
+pkgs <- c("readr", "dplyr", "lubridate", "ggplot2", "MMWRweek", "RColorBrewer")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(MMWRweek)
+```
+
+> **Note:** the seasonal plot borrows a colour palette via `RColorBrewer::brewer.pal(...)`. We call it with `::` rather than `library()` since we only need the one function, but `RColorBrewer` is in the install loop above, so it's guaranteed to be available.
+
+## Define file paths in one place
+
+As before, we name every file up front so there's a single source of truth. This script *reads* one file — the cleaned CSV produced by step 01 — and *writes* three: two figures and one small summary table.
+
+Notice the output convention again: everything this script produces lives under a folder named after the script itself (`02_data_explore`). Step 01's outputs sat under `01_cleaning`; ours sit under `02_data_explore`. Keeping outputs partitioned by the script that made them means results never collide and it's always obvious which step produced which file.
+
+```{r paths}
+cleaned_csv   <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+national_plot <- "output/figures/02_data_explore/national_trend.png"
+seasonal_plot <- "output/figures/02_data_explore/seasonal_comparison.png"
+peak_csv      <- "output/data/02_data_explore/peak_description.csv"
+```
+
+> **Knitting note:** these are *relative* paths, so they assume your working directory is the project root (the folder that contains `output/`). Because this script reads step 01's output, that step needs to have run first — its `cleaned_flu_admissions.csv` is our input.
+
+## Create output folders if they don't exist
+
+Same good manners as before: don't assume the destination folders exist. `dir.create` with `recursive = TRUE` builds the full tree, and `showWarnings = FALSE` keeps it quiet on a re-run when the folders are already there. `dirname()` strips the filename off each path, leaving just the folder to create.
+
+```{r make-dirs}
+dir.create(dirname(national_plot), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(seasonal_plot), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(peak_csv),      recursive = TRUE, showWarnings = FALSE)
+```
+
+## Make sure the input actually exists
+
+Before reading anything, we confirm the cleaned file is where we expect. If it isn't, we `stop()` immediately with a message naming the missing path — far better than a cryptic read error three lines later. This is the **fail early, fail loudly** habit: the most useful place to catch a missing input is the very first moment you'd need it.
+
+```{r check-input}
+if (!file.exists(cleaned_csv)) stop(paste0("Missing input: ", cleaned_csv))
+```
+
+## Read the cleaned data
+
+We read every column as character (`col_types = cols(.default = "c")`), for the same reason we did in the cleaning step: we'd rather convert each column to its real type *on purpose*, a few lines from now, than let `readr` guess and occasionally guess wrong. Reading as text is the cautious default that keeps parsing under our control.
+
+```{r read-cleaned}
+df <- read_csv(cleaned_csv, col_types = cols(.default = "c"))
+```
+
+## Make the column names match what we expect
+
+We *expect* the three columns `week`, `location`, `value` — but this block is defensive about it. If the names don't already match, it lowercases them and translates a handful of known aliases (the raw dataset's `week ending date`, `geographic aggregation`, and either spelling of the admissions column) back to our standard names.
+
+Then it re-checks: if all three required names still aren't present, it stops. The point is to be *forgiving about input variation* but *strict about the final contract* — accept a few reasonable spellings, but refuse to continue unless the table really has the columns everything downstream depends on.
+
+```{r fix-names}
+# Expected column names and order: week, location, value
+if (!all(names(df) %in% c("week", "location", "value"))) {
+  # Attempt to coerce common variations
+  names(df) <- tolower(names(df))
+  if ("week ending date" %in% names(df)) names(df)[names(df) == "week ending date"] <- "week"
+  if ("geographic aggregation" %in% names(df)) names(df)[names(df) == "geographic aggregation"] <- "location"
+  if ("total.influenza.admissions" %in% names(df)) names(df)[names(df) == "total.influenza.admissions"] <- "value"
+  if ("total influenza admissions" %in% names(df)) names(df)[names(df) == "total influenza admissions"] <- "value"
+}
+
+# After renaming attempt, check presence
+if (!all(c("week", "location", "value") %in% names(df))) stop("Required columns missing from cleaned CSV")
+```
+
+## Parse the week column into real dates
+
+Dates arrive as text and need to become actual `Date` objects so they'll sort and plot as time. Rather than assume one format, this block **tries several in order** inside a `tryCatch`: first the ISO-style `as.Date`, then `lubridate`'s `ymd` (year-month-day), then `mdy` (month-day-year). Each fallback only fires if the previous attempt produced all `NA`s — i.e. if it clearly failed.
+
+If none of them work, we stop with a plain-English message. This is a small example of a broadly useful pattern: **try the likely formats, and refuse to guess silently** — a column full of unparseable dates should halt the pipeline, not quietly become a column of `NA`s.
+
+```{r parse-week}
+parsed_week <- tryCatch({
+  # try multiple common formats
+  w <- as.Date(df$week)
+  if (all(is.na(w))) w <- ymd(df$week)
+  if (all(is.na(w))) w <- mdy(df$week)
+  if (all(is.na(w))) stop("parse fail")
+  w
+}, error = function(e) NA)
+if (all(is.na(parsed_week))) stop("The week could not be parsed.")
+
+df$week <- parsed_week
+```
+
+## Parse the value column into numbers
+
+The admissions counts are text too. `parse_number()` extracts the numeric value from each string, tolerating stray commas or symbols along the way. As with the dates, if the whole column fails to parse we stop rather than continue with a column of `NA`s.
+
+```{r parse-value}
+parsed_value <- tryCatch({
+  # remove commas and parse as numeric
+  v <- parse_number(df$value)
+  if (all(is.na(v))) stop("parse fail")
+  v
+}, error = function(e) NA)
+if (all(is.na(parsed_value))) stop("The value could not be parsed.")
+
+df$value <- as.numeric(parsed_value)
+```
+
+## Re-check the structure before going further
+
+Even though step 01 already validated this table, we check it again here. That isn't paranoia for its own sake — it's the principle that **each script should be responsible for its own inputs.** If someone edits the cleaned CSV by hand, or a different file gets pointed at this script, these checks are what catch it before a broken table reaches the plots.
+
+Read this block as the same "definition of done" we used in cleaning, applied at the door of this script:
+
+- `location` is entirely `"US"` (we're the national series and nothing else);
+- there's at least one row;
+- the first three columns are *exactly* `week`, `location`, `value`, in that order — and if they aren't, we `select()` them into place and only then insist on it;
+- `week` really is a `Date`, `value` really is numeric, and there are no `NA`s hiding in `value`.
+
+Any failure halts the script immediately, so nothing downstream can build on a table that doesn't meet the contract.
+
+```{r structure-checks}
+# Validate location
+if (!all(df$location == "US")) stop("location must be all 'US'")
+
+# Final structural checks
+if (nrow(df) == 0) stop("Data has zero rows")
+if (!identical(names(df)[1:3], c("week", "location", "value"))) {
+  # reorder/rename accordingly
+  df <- df %>% select(week, location, value)
+  if (!identical(names(df), c("week", "location", "value"))) stop("Column names must be exactly week, location, value in that order")
+}
+if (!inherits(df$week, "Date")) stop("week must be a Date column")
+if (!is.numeric(df$value)) stop("value must be numeric")
+if (any(is.na(df$value))) stop("value contains NA after parsing")
+```
+
+## Work out the flu-season window
+
+Now the epidemiology. Flu seasons don't line up with calendar years — a season straddles the winter, running from the autumn of one year into the spring of the next. By long-standing convention, a US influenza season is defined as **MMWR week 40 through MMWR week 20 of the following year** (roughly early October to mid-May).
+
+MMWR weeks are the CDC's standardised epidemiological week numbering; the `MMWRweek` package converts any calendar date into its MMWR week and year. To turn "week 40 of 2025" into an actual date, the helper below walks every day of a year, asks `MMWRweek()` for each day's week number, and returns the first calendar date whose MMWR week matches the target. We use it twice: once for the season start (week 40 of 2025) and once for the season end (week 20 of 2026).
+
+If either boundary can't be resolved, we stop — a season we can't place on the calendar is one we can't highlight or filter by later.
+
+```{r season-window}
+# Print season boundaries for current season 2025-2026
+current_season_label <- "2025-2026"
+season_start_year <- 2025
+
+# Helper: find first calendar date in a year with given MMWR week
+first_date_with_mmwr <- function(year, target_week) {
+  start <- as.Date(paste0(year, "-01-01"))
+  end   <- as.Date(paste0(year, "-12-31"))
+  dates <- seq.Date(start, end, by = "day")
+  mmwr  <- MMWRweek(dates)
+  idx   <- which(mmwr$MMWRweek == target_week & mmwr$MMWRyear == year)
+  if (length(idx) == 0) return(NA)
+  dates[min(idx)]
+}
+
+season_start <- first_date_with_mmwr(season_start_year, 40)
+season_end   <- first_date_with_mmwr(season_start_year + 1, 20)
+if (is.na(season_start) || is.na(season_end)) stop("Could not determine season boundaries via MMWRweek")
+
+cat("Season Start Week:", format(season_start, "%Y-%m-%d"), "\n")
+cat("Season End Week:",   format(season_end,   "%Y-%m-%d"), "\n")
+```
+
+## Plot the national trend
+
+The first figure is the simplest useful view of the data: admissions over the whole time span, as a single line, with the current season shaded so the eye is drawn to it.
+
+Reading the `ggplot` layers top to bottom:
+
+- **`annotate("rect", ...)`** paints the light-grey season highlight *first*, so everything else is drawn on top of it. `ymin = -Inf, ymax = Inf` stretches it the full height of the panel.
+- **`geom_line(...)`** draws the admissions series in blue.
+- **`scale_x_date(breaks = breaks, ...)`** thins the date axis to every sixth week (computed just above via `break_idx`), so the labels don't overlap into an unreadable smear.
+- **`coord_cartesian(ylim = c(0, y_max))`** fixes the y-axis to start at zero with a little headroom, so bar heights are honest and comparable.
+- **`theme_minimal()` and the `theme(...)`** tidy the look, centre and bold the title, and angle the date labels 45° so they fit.
+
+After building the plot we drop a bold **text label** at the top of the highlighted band, and save the figure with `ggsave(...)` at 300 DPI — the crisp, report-ready version on disk. We also print the plot object on its own line so it renders inline here in the knitted document.
+
+```{r national-trend, fig.width=10, fig.height=6, fig.cap="US weekly influenza hospitalization admissions over time, current season shaded."}
+plot_df <- df %>% arrange(week)
+
+# Determine x-axis breaks: show only every 6 dates (unique weeks)
+unique_weeks <- sort(unique(plot_df$week))
+break_idx <- seq(1, length(unique_weeks), by = 6)
+breaks <- unique_weeks[break_idx]
+
+y_max <- max(plot_df$value, na.rm = TRUE) + 10000
+
+p1 <- ggplot(plot_df, aes(x = week, y = value)) +
+  # season highlight rectangle behind everything
+  annotate("rect", xmin = season_start, xmax = season_end, ymin = -Inf, ymax = Inf, fill = "lightgrey", alpha = 0.4) +
+  geom_line(color = "blue") +
+  labs(x = "Week", y = "Weekly Total Influenza Admissions (USA)", title = "USA Weekly Influenza Hospitalization Admissions") +
+  scale_x_date(breaks = breaks, date_labels = "%m-%Y") +
+  coord_cartesian(ylim = c(0, y_max)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+
+# place season label at top of highlight
+label_y <- y_max - 0.02 * (y_max)
+p1 <- p1 + annotate("text", x = season_start + (season_end - season_start) / 2, y = label_y, label = paste0(current_season_label, " Season"), fontface = "bold")
+
+# Save at 300 DPI, then render inline
+ggsave(national_plot, p1, dpi = 300, width = 10, height = 6)
+p1
+```
+
+## Compare seasons on a common timeline
+
+A national trend shows the overall history, but it doesn't let you answer "is *this* season worse than last year's, week for week?" To do that we need to **overlay** the seasons — draw each one as its own line on a shared x-axis that runs from the start of a season to its end, rather than across real calendar time.
+
+That takes a bit of bookkeeping, so we do it in stages. First we tag every row with its MMWR week, MMWR year, and calendar month:
+
+```{r season-tag}
+# SEASONAL COMPARISON
+# Assign MMWR week and season label to each row
+mmwr_info <- MMWRweek(plot_df$week)
+plot_df$mmwr_week <- mmwr_info$MMWRweek
+plot_df$mmwr_year <- mmwr_info$MMWRyear
+plot_df$month <- month(plot_df$week)
+```
+
+Next, each row needs to know *which season it belongs to*. That's not just its calendar year, because a season spans two of them. The helper below encodes the convention, taking each row's MMWR week, its plain calendar year (`year(week)`), and its month, and returning the year the season *started*:
+
+- MMWR week **≥ 40** in the autumn (months Sep–Dec) belongs to *this* calendar year's season; the same high week number appearing in Jan–Aug is an edge case attributed to the *previous* year's season.
+- MMWR week **≤ 20** is the spring tail of the season that *started the previous autumn*, so it's attributed to the previous year.
+- Weeks **21–39** fall in the off-season and get `NA` — they aren't part of any season window.
+
+We then build a human-readable `season_label` like `"2025-2026"` from the start year, and keep only rows at or before the current season so we're not plotting a partial future.
+
+```{r season-assign}
+assign_season_start <- function(mmwr_week, cal_year, month) {
+  # If MMWR week >= 40: if calendar month Jan-Aug attribute to previous year's season
+  if (mmwr_week >= 40) {
+    if (month >= 1 && month <= 8) {
+      start_year <- cal_year - 1
+    } else {
+      start_year <- cal_year
+    }
+  } else if (mmwr_week <= 20) {
+    start_year <- cal_year - 1
+  } else {
+    start_year <- NA_integer_
+  }
+  start_year
+}
+
+plot_df$season_start_year <- mapply(assign_season_start, plot_df$mmwr_week, year(plot_df$week), plot_df$month)
+plot_df$season_label <- ifelse(!is.na(plot_df$season_start_year), paste0(plot_df$season_start_year, "-", plot_df$season_start_year + 1), NA)
+
+# Exclude data after current season for seasonal comparison
+plot_df <- plot_df %>% filter(is.na(season_label) | season_label <= current_season_label)
+```
+
+Now the trick that makes the overlay work. We define the season's natural week order as `c(40:53, 1:20)` — weeks 40 through the end of the year, then wrapping around to weeks 1 through 20. Keeping only those weeks and `match()`-ing each row's MMWR week against that vector gives every row a **`week_of_season`** from 1 upward. Two different seasons that were months apart on the calendar now share the same x-position if they're at the same point in *their* season.
+
+```{r season-align}
+# Keep only weeks 40-53 and 1-20 for season plotting
+season_weeks_order <- c(40:53, 1:20)
+plot_df <- plot_df %>% filter(mmwr_week %in% season_weeks_order)
+plot_df$week_of_season <- match(plot_df$mmwr_week, season_weeks_order)
+
+# For plotting, remove NA seasons (outside season range)
+season_plot_df <- plot_df %>% filter(!is.na(season_label))
+```
+
+With the data aligned, we set up the visual encodings so the **current season stands out** against the historical ones. Every past season gets a colour from a `RColorBrewer` palette, a dashed line, and a thinner stroke; the current `2025-2026` season is overridden to solid blue and drawn thicker. Mapping season to colour, linetype, *and* linewidth all at once is what makes the reference season unmistakable at a glance.
+
+```{r season-styles}
+# Define line type and color mappings
+seasons <- sort(unique(season_plot_df$season_label))
+colors <- setNames(RColorBrewer::brewer.pal(max(3, length(seasons)), "Set1")[1:length(seasons)], seasons)
+# Force current season color to blue so it stands out
+if (current_season_label %in% seasons) colors[current_season_label] <- "blue"
+
+linetypes <- setNames(rep("dashed", length(seasons)), seasons)
+if (current_season_label %in% seasons) linetypes[current_season_label] <- "solid"
+
+# Line widths: current season thicker
+line_widths <- ifelse(seasons == current_season_label, 1.2, 0.8)
+names(line_widths) <- seasons
+```
+
+Finally the plot itself. Each season is one line, grouped and coloured by `season_label`, with the manual scales feeding in the colours, linetypes, and sizes we just built. The x-axis is relabelled back to the real MMWR week numbers (40, 42, 44, … wrapping around to 1, 3, … 19), showing every other week so the axis stays readable. As with the first figure, we save a 300-DPI copy to disk and print the object to render it inline.
+
+```{r seasonal-comparison, fig.width=10, fig.height=6, fig.cap="Seasons overlaid on a common week-of-season timeline; the current season in solid blue."}
+p2 <- ggplot(season_plot_df, aes(x = week_of_season, y = value, group = season_label, color = season_label, linetype = season_label)) +
+  geom_line(aes(linewidth = season_label)) +
+  scale_color_manual(name = "Season", values = colors) +
+  scale_linetype_manual(name = "Season", values = linetypes) +
+  scale_linewidth_manual(name = "Season", values = line_widths) +
+  labs(x = "Week of Season", y = "Weekly Total Influenza Admissions (USA)", title = "USA Weekly Influenza Hospitalization Admissions") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1))
+
+# X axis labels: numeric MMWR week numbers, show every other week
+week_labels <- season_weeks_order
+week_positions <- seq_along(week_labels)
+label_positions <- week_positions[seq(1, length(week_positions), by = 2)]
+label_texts <- week_labels[label_positions]
+
+p2 <- p2 + scale_x_continuous(breaks = label_positions, labels = label_texts) + coord_cartesian(ylim = c(0, y_max))
+
+# Save seasonal plot, then render inline
+ggsave(seasonal_plot, p2, dpi = 300, width = 10, height = 6)
+p2
+```
+
+## Find the peak of the current season
+
+The last piece of analysis distils the current season down to a few numbers the next steps can use. We filter to just `2025-2026`, and stop if there's nothing there — no current-season data means there's nothing to describe.
+
+Two quantities come out of this block, both computed by simple, **deterministic rules** (no smoothing, no judgement calls — just definitions the code can apply the same way every time):
+
+- **Peak** — `which.max()` finds the row with the highest value, giving us both the `peak_time` (its week) and the `peak_intensity` (that value). When there are ties, `which.max` takes the earliest, which is the behaviour we want.
+- **Decline start** — the first week *after* the peak whose value drops below the week before it. That's a plain, reproducible marker for "the season has turned the corner." If no such week exists yet (the season is still at or climbing to its peak), it stays `NA`.
+
+We package these, plus the season boundaries, into a one-row tibble.
+
+```{r peak-analysis}
+# PEAK ANALYSIS for CURRENT SEASON ONLY (2025-2026)
+peak_df <- plot_df %>% filter(season_label == current_season_label)
+if (nrow(peak_df) == 0) stop("No data for current season in input")
+
+# Peak_Time: date of global max (earliest if ties)
+idx_peak <- which.max(peak_df$value)
+peak_time <- peak_df$week[idx_peak]
+peak_intensity <- peak_df$value[idx_peak]
+
+# Decline_Start: deterministic rule implemented per agents.md:
+# "the first calendar `week` after the `Peak_Time` for which the current
+# week's `value` is strictly less than the previous week's `value`."
+# This loop finds that first date (if any) and preserves it as a Date.
+decline_start <- NA
+if (idx_peak < nrow(peak_df)) {
+  for (i in (idx_peak + 1):nrow(peak_df)) {
+    if (peak_df$value[i] < peak_df$value[i - 1]) {
+      decline_start <- peak_df$week[i]
+      break
+    }
+  }
+}
+
+peak_out <- tibble(
+  Peak_Time      = as.Date(peak_time),
+  Peak_Intensity = as.numeric(peak_intensity),
+  Decline_Start  = as.Date(decline_start),
+  Season_Start   = as.Date(season_start),
+  Season_End     = as.Date(season_end)
+)
+
+peak_out
+```
+
+## Save the peak description and confirm everything landed
+
+With the summary built, we write it out and then close the loop on the whole script: three `file.exists()` checks confirm that *both* figures and the peak CSV actually made it to disk. Verifying your outputs exist is the counterpart to validating your inputs — it's how a script earns the right to print "Done" and mean it.
+
+```{r write-outputs}
+write_csv(peak_out, peak_csv)
+
+# Final existence checks
+if (!file.exists(national_plot)) stop("National plot not written")
+if (!file.exists(seasonal_plot)) stop("Seasonal plot not written")
+if (!file.exists(peak_csv))      stop("Peak CSV not written")
+
+cat("Done: generated national plot, seasonal plot, and peak CSV.\n")
+```
+
+## Where this leads
+
+We came in with a clean three-column table and came out with three things a forecaster actually reasons about: a national trend, a season-over-season comparison, and a compact summary of where the current season peaked and when it began to turn. The season window and the peak description in particular aren't just for looking at — they're inputs the modelling step can lean on directly. As always, the care taken here (re-validating the input, defining the season and the peak by explicit rules, confirming the outputs) is what makes everything built on top of it trustworthy.
