@@ -1,0 +1,37 @@
+{
+  "name": "SISMID 2026 - Course Coding Environment",
+  "build": { "dockerfile": "Dockerfile", "context": ".." },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/rocker-org/devcontainer-features/quarto-cli:1": { "version": "latest" },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "reditorsupport.r",
+        "rdebugger.r-debugger",
+        "quarto.quarto",
+        "mechatroner.rainbow-csv",
+        "anthropic.claude-code",
+        "github.copilot",
+        "github.copilot-chat",
+        "openai.chatgpt"
+      ],
+      "settings": {
+        "r.rterm.linux": "/usr/local/bin/radian",
+        "r.bracketedPaste": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    },
+    "codespaces": { "openFiles": ["README.md"] }
+  },
+  "remoteUser": "rstudio",
+  "forwardPorts": [8787],
+  "portsAttributes": { "8787": { "label": "RStudio Server", "onAutoForward": "silent" } },
+  "mounts": [
+    "source=claude-config-${devcontainerId},target=/home/rstudio/.claude,type=volume"
+  ],
+  "postCreateCommand": "bash .devcontainer/postcreate.sh",
+  "postAttachCommand": "bash .devcontainer/welcome.sh"
+}

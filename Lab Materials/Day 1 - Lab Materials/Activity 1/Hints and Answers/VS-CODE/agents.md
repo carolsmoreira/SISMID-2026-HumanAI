@@ -1,90 +1,88 @@
 # Data Cleaning Agent — `clean_flu_admissions`
 
 ## Purpose
-Turn the raw NHSN HRD influenza CSV into a tidy three-column dataset and
-produce an epicurve figure. The agent implements the cleaning rules from
-`rules.md` as a reproducible, checkable process.
 
-## Inputs
-- `data/Weekly Hospital Respiratory Data (HRD) Metrics by Jurisdiction.csv`
+Turn the raw NHSN Hospital Respiratory Data (HRD) file into a tidy, three-column
+US influenza admissions dataset and produce an epicurve figure. This agent is the
+executable form of `rules.md`: every rule there is implemented as a step below and
+enforced by a validation check.
 
-## Outputs
-- `output/data/01_cleaning/cleaned_flu_admissions.csv`
-- `output/figures/01_cleaning/epicurve_us_flu_admissions.png`
+## Scope
+
+- Owns: `output/scripts/01_cleaning.R`
+- Reads: `data/Weekly Hospital Respiratory Data (HRD) Metrics by Jurisdiction.csv`
+- Writes:
+  - `output/data/01_cleaning/cleaned_flu_admissions.csv`
+  - `output/figures/01_cleaning/epicurve_us_flu_admissions.png`
+- Does not modify anything in `data/`. The raw file is read-only.
+
+## Working directory
+
+The script uses paths relative to the project root (the folder containing `data/`).
+Run it from that folder:
+
+```r
+setwd("<path to>/DEMO")
+source("output/scripts/01_cleaning.R")
+```
+
+or from a terminal: `Rscript "output/scripts/01_cleaning.R"`
+
+## Dependencies
+
+`readr`, `dplyr`, `ggplot2`. The script stops with a clear message naming any
+package that is missing rather than failing partway through.
 
 ## Steps (ordered)
-1. Load the data
-   - Use `readr::read_csv()` to read the CSV from the `data/` folder.
-   - Import only these columns as `character` initially:
-     - `Week Ending Date`
-     - `Geographic aggregation`
-     - One of the allowed influenza admissions columns (see Step 3)
 
-2. Filter to US only
-   - Keep only rows where `Geographic aggregation` == `"USA"`.
+1. **Load the data** — read the CSV with `readr::read_csv()`, importing only the
+   three columns that are needed (`Week Ending Date`, `Geographic aggregation`,
+   and the influenza admissions column). Import everything as `character` so the
+   ~400 unrelated columns cannot trigger parsing warnings, then convert types
+   explicitly.
+2. **Filter to US only** — keep rows where `Geographic aggregation == "USA"`.
+   Note the raw value is `"USA"`; the output label is `"US"`.
+3. **Select the target column** — accept `Total.Influenza.Admissions` or
+   `Total Influenza Admissions`, in that order of preference. Stop with an
+   actionable error if neither is present.
+4. **Reshape to three columns** — produce exactly `week`, `location`, `value`, in
+   that order, with `location` set to `"US"` on every row. Parse `value` with
+   `readr::parse_number()` so comma-formatted counts such as `"1,110"` become
+   `1110`. Do not use `parse_double()` on those strings.
+5. **Format dates** — convert `Week Ending Date` to a `Date` in `week` (the file
+   uses ISO `YYYY-MM-DD`) and sort ascending by `week`.
+6. **Save the cleaned data** — write `cleaned_flu_admissions.csv` to
+   `output/data/01_cleaning/`, creating the folder if needed.
+7. **Generate the epicurve** — bar-style plot of `value` (numeric) against `week`,
+   saved to `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
 
-3. Select the target column
-   - Allowed names (in order of preference):
-     - `Total.Influenza.Admissions`
-     - `Total Influenza Admissions`
-   - If neither column exists, the agent must stop with a clear error message.
+## Validation checks (stop on failure)
 
-4. Reshape to three columns
-   - Rename and produce exactly these columns, in this order:
-     1. `week`
-     2. `location` — set every row to the string `"US"`
-     3. `value`
-   - Parse `value` using `readr::parse_number()` so comma-formatted numbers parse
-     correctly (e.g., `"1,110"` -> `1110`). Do not use `parse_double()` on
-     comma-formatted strings directly.
+Each check calls `stop()` with a message naming the failed rule:
 
-5. Format dates
-   - Convert `Week Ending Date` into an R `Date` object and store in `week`.
-   - Sort the data ascending by `week`.
-
-6. Save the cleaned data
-   - Write `cleaned_flu_admissions.csv` to `output/data/01_cleaning/`.
-
-7. Generate epicurve
-   - Produce an epicurve saved to
-     `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
-   - Plot specs:
-     - X-axis: `week`
-     - Y-axis: `value` (ensure numeric; use e.g. `as.numeric(value)`)
-     - Use a bar plot (or similar) that accepts a numeric `height` vector.
-
-## Validation checks (must stop on failure)
-- Row count > 0 after cleaning.
-- Column names are exactly `week`, `location`, `value` in that order.
-- All values in `location` are the string `"US"`.
-- `week` column inherits from `Date`.
+- Row count is greater than 0.
+- Column names are exactly `week`, `location`, `value`, in that order.
+- Every `location` value is `"US"`.
+- `week` inherits class `Date`, with no `NA` after parsing.
 - `value` is numeric.
-- `value` contains no `NA` after parsing.
-- Output CSV exists at `output/data/01_cleaning/cleaned_flu_admissions.csv`.
-- Epicurve file exists at `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
+- `value` has no `NA` after parsing.
+- The output CSV exists at `output/data/01_cleaning/cleaned_flu_admissions.csv`.
+- The figure exists at `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
 
 ## Failure behavior
-- When a validation fails, the agent must stop execution and print a clear
-  diagnostic message explaining which check failed and why.
 
-## Implementation notes / best practices
-- Read required columns as `character` first, then explicitly parse/convert
-  (`readr::parse_number()`, `as.Date()` with an appropriate format).
-- Create output directories if they do not exist before writing files.
-- Keep error messages user-friendly and actionable.
-- Prefer base R plotting or `ggplot2` as available; ensure the plotting input
-  uses numeric types to avoid `height` errors in bar plots.
+Stop immediately on the first failed check and print a diagnostic that says which
+check failed and what was observed instead. Never write a partial or unvalidated
+output file — validation runs before the CSV is written.
 
-## Example R pseudocode outline
+## Conventions
 
-1. Read CSV with `col_select` or `select()` to the minimal columns.
-2. Detect the influenza column name, error if missing.
-3. Subset to `Geographic aggregation == "USA"`.
-4. Build a tibble/data.frame with columns `week`, `location` ("US"), `value`.
-5. Parse numbers and dates, sort, run validations.
-6. Write CSV and save plot.
+- Create output directories with `dir.create(..., recursive = TRUE)` before writing.
+- Refer to raw columns with backticks; they contain spaces.
+- Keep the script re-runnable: running it twice produces identical outputs.
+- Print a short summary (rows written, date range, output paths) on success.
 
----
+## Expected result
 
-Generated from `rules.md` to be used by an automated agent or as a human
-checklist for `01_cleaning.R` implementation.
+As of the current data file: 307 US weeks spanning 2020-08-08 through 2026-06-20,
+no missing values.

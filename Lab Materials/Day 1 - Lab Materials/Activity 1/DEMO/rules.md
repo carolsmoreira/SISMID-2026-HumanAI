@@ -1,6 +1,6 @@
 # Data Cleaning Rules
 
-These rules define how the agent should generate `01_cleaning.R`. Follow each
+These rules define how the agent should generate `output/scripts/01_cleaning.R`. Follow each
 step in order. The goal is to turn the raw NHSN HRD influenza file into a tidy,
 three-column dataset ready for downstream modeling and produce an epicurve
 figure.
