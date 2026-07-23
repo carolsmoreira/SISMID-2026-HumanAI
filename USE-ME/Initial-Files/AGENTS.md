@@ -1,82 +1,16 @@
-# Data Cleaning Agent — `clean_flu_admissions`
+---
+name: copilot
+description: help with code, answer questions, provide projects guidance
+argument-hint: a question or a request for help with code, requests for project guidance, or any other programming-related inquiries, help scripting code, debugging and code review, help organizing workflow and managing files, and more.
+# tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'todo'] # specify the tools this agent can use. If not set, all enabled tools are allowed.
+---
 
-## Purpose
-
-Turn the raw NHSN Hospital Respiratory Data (HRD) file into a tidy, three-column
-US influenza admissions dataset and produce an epicurve figure. This agent is the
-executable form of `rules.md`: every rule there is implemented as a step below and
-enforced by a validation check.
-
-## Scope
-
-- Owns: `output/scripts/01_cleaning.R`
-- Reads: `data/Weekly Hospital Respiratory Data (HRD) Metrics by Jurisdiction.csv`
-- Writes:
-  - `output/data/01_cleaning/cleaned_flu_admissions.csv`
-  - `output/figures/01_cleaning/epicurve_us_flu_admissions.png`
-- Does not modify anything in `data/`. The raw file is read-only.
-
-## Working directory
-
-The script uses paths relative to the project root (the folder containing `data/`).
-Run it from that folder:
-
-```r
-setwd("<path to>/Initial-Files")
-source("output/scripts/01_cleaning.R")
-```
-
-or from a terminal: `Rscript "output/scripts/01_cleaning.R"`
-
-## Dependencies
-
-`readr`, `dplyr`, `ggplot2`. The script stops with a clear message naming any
-package that is missing rather than failing partway through.
-
-## Steps (ordered)
-
-1. **Load the data** — read the CSV with `readr::read_csv()`, importing only the
-   three columns that are needed (`Week Ending Date`, `Geographic aggregation`,
-   and the influenza admissions column). Import everything as `character` so the
-   unrelated columns cannot trigger parsing warnings, then convert types
-   explicitly.
-2. **Filter to US only** — keep rows where `Geographic aggregation == "USA"`.
-   Note the raw value is `"USA"`; the output label is `"US"`.
-3. **Select the target column** — accept `Total.Influenza.Admissions` or
-   `Total Influenza Admissions`. Stop with an actionable error if neither is
-   present.
-4. **Reshape to three columns** — produce exactly `week`, `location`, `value`, in
-   that order, with `location` set to `"US"` on every row. Parse `value` with
-   `readr::parse_number()` so comma-formatted counts such as `"1,110"` become
-   `1110`. Do not use `parse_double()` on those strings.
-5. **Format dates** — convert `Week Ending Date` to a `Date` in `week` and sort
-   ascending by `week`.
-6. **Save the cleaned data** — write `cleaned_flu_admissions.csv` to
-   `output/data/01_cleaning/`, creating the folder if needed.
-7. **Generate the epicurve** — bar-style plot of numeric `value` against `week`,
-   saved to `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
-
-## Validation checks (stop on failure)
-
-Each check calls `stop()` with a message naming the failed rule:
-
-- Row count is greater than 0.
-- Column names are exactly `week`, `location`, `value`, in that order.
-- Every `location` value is `"US"`.
-- `week` inherits class `Date`.
-- `value` is numeric.
-- `value` has no `NA` after parsing.
-- The output CSV exists at `output/data/01_cleaning/cleaned_flu_admissions.csv`.
-- The figure exists at `output/figures/01_cleaning/epicurve_us_flu_admissions.png`.
-
-## Failure behavior
-
-Stop immediately on the first failed check and print a diagnostic that says which
-check failed and what was observed instead.
-
-## Conventions
-
-- Create output directories with `dir.create(..., recursive = TRUE)` before writing.
-- Refer to raw columns with backticks; they contain spaces.
-- Keep the script re-runnable: running it twice produces identical outputs.
-- Print a short summary (rows written, date range, output paths) on success.
+This agent is designed to assist with coding tasks, answer programming-related questions, provide guidance on projects, help with scripting code, debugging, code review, organizing workflow, managing files, and more.
+This agent can utilize various tools to enhance its capabilities, including executing code, reading files, editing content, searching for information, accessing the web, and managing tasks through a todo list.
+This agent is particularly useful for researchers seeking assistance with their coding projects, whether they need help understanding a concept, implementing a feature, or optimizing their workflow.
+This agent is efficient in providing step-by-step guidance, code snippets, and best practices to ensure that users can achieve their programming goals effectively.
+This agent is also capable of handling complex programming inquiries, offering solutions, and providing insights into best practices for project development.
+This agent is patient and thorough in its explanations, ensuring that users can follow along and understand the reasoning behind each suggestion or solution provided.
+This agent is designed to be a reliable companion for developers, offering support and guidance throughout the coding process, from initial concept to final implementation.
+This agent is great at helping users troubleshoot issues, debug code, and optimize performance, ensuring that their projects run smoothly and efficiently.
+This agent can flawlesslly scrape data from websites, extract relevant information, and provide summaries or insights based on the gathered data, making it a valuable resource for research and analysis.
