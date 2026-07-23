@@ -342,7 +342,12 @@ For each reference date `r`:
 
 1. Use `r` directly as a Date `reference_date` for training-window selection
    and output. Serialize `reference_date` and `target_end_date` as ISO dates.
+   Explicitly validate that `reference_date` and all `target_end_date` values
+   are R `Date` objects, not character or POSIXct values.
 2. Fit the model once on rows with `week <= reference_date`.
+   Explicitly validate that the maximum training `week` is no later than
+   `reference_date` and is strictly earlier than every target date; halt if
+   this no-look-ahead condition fails.
 3. Call `forecast(fit, h = 3, level = LEVELS)` once, where
    `LEVELS = c(98, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10)`.
 4. Extract the forecast mean as quantile `0.5`, and lower/upper bounds for all
@@ -406,6 +411,111 @@ when absent, at 300 DPI.
 - Use the bold, centered title `USA 1-, 2-, & 3-Week-Ahead Influenza Hospitalization Forecast (2025-26 Season)`.
 - Provide one legend that includes Observed plus the forecast median and 95% PI
   for every horizon, with consistent horizon colors.
+
+---
+
+# Activity 4: Evaluation
+
+Save evaluation code to `output/scripts/04_evaluation.R`. Create all missing
+output folders before writing files.
+
+## 1. Input and Evaluation Set
+
+- Read forecasts from `output/data/03_forecast/flusight_forecasts.csv` and
+  observed admissions from `output/data/01_cleaning/cleaned_flu_admissions.csv`.
+- Parse forecast dates, horizons, quantile IDs, and values explicitly. Require
+  observed data to contain `week`, `location`, and numeric `value`, with
+  `location == "US"`.
+- Join an observed outcome to each forecast using
+  `target_end_date == week` and `location`. Score only forecast instances whose
+  target end date is present in observed data; do not score future targets.
+- Require the full 23-level FluSight quantile ladder for every scored forecast.
+
+## 2. Scores and Coverage
+
+- For each reference-date/horizon forecast, calculate median absolute error,
+  squared error, 95% prediction-interval width, and 95% coverage using the
+  `0.025` and `0.975` quantiles.
+- Calculate the weighted interval score (WIS) across all 23 quantiles. Lower
+  WIS is better because it rewards accurate, sharp, calibrated forecasts.
+- Summarize, separately for horizons 1, 2, and 3: number of scored forecasts,
+  MAE, RMSE, mean WIS, 95% coverage, and mean 95% interval width.
+- Validate all input parsing, the required quantile ladder, existence of
+  observed targets, and successful creation of outputs.
+
+Write:
+
+- `output/data/04_evaluation/forecast_scores.csv`
+- `output/data/04_evaluation/evaluation_summary_by_horizon.csv`
+
+## 3. Evaluation Figures
+
+- Save `output/figures/04_evaluation/evaluation_metrics_by_horizon.png` at
+  300 DPI. Use separate panels for MAE, RMSE, mean WIS, 95% coverage, and mean
+  95% interval width so incomparable scales are not combined.
+- Save `output/figures/04_evaluation/uncertainty_boxplot_by_horizon.png` at
+  300 DPI. Show the distribution of 95% prediction-interval widths by horizon;
+  include a mean marker and explain boxes/whiskers in the subtitle.
+
+## 4. Diagnostics, Baselines, and Calibration
+
+- Save final-fit ARIMA residual diagnostics to
+  `output/data/03_forecast/arima_residual_diagnostics.csv` and
+  `output/figures/03_forecast/arima_residual_diagnostics.png`. Include the
+  selected ARIMA order, residual summary, Ljung-Box statistic, and p-value.
+- Compare ARIMA median forecasts with leakage-free persistence and seasonal
+  naive baselines. Persistence uses the observed value on the reference date;
+  seasonal naive uses the observed value 364 days before the target date.
+  Summarize MAE and RMSE by model and horizon.
+- Save the comparison table to
+  `output/data/04_evaluation/model_comparison_by_horizon.csv` and the MAE
+  figure to `output/figures/04_evaluation/model_comparison_by_horizon.png`.
+- Create retrospective 95% interval-calibration recommendations by horizon,
+  based on forecast errors and current interval widths. Save them to
+  `output/data/04_evaluation/interval_calibration_recommendations.csv`.
+  Clearly label them as retrospective diagnostics; do not apply them to a
+  forecast using outcomes that were unavailable at its reference date.
+
+---
+
+# Activity 5: Incremental Revisions
+
+Save improvement code to `output/scripts/05_improvements.R`. The purpose is to
+make a controlled, evidence-based revision to the Activity 3 baseline—not to
+replace it without comparison.
+
+## 1. Choose and Document One Improvement
+
+- Start from the validated Activity 3 pipeline and choose one improvement, for
+  example a seasonal ARIMA/Fourier specification, exponential smoothing, a
+  calibrated interval method using only earlier errors, or an ensemble with a
+  validated baseline.
+- State the selected improvement, its rationale, and exactly which inputs are
+  available at every reference date. Do not introduce data leakage.
+- If external covariates are added, they must be known at the reference date
+  and their values must be available or independently forecast for all three
+  future horizons.
+
+## 2. Refit, Forecast, and Evaluate
+
+- Preserve the same 2025-26 testing period, reference-date construction,
+  expanding-window cutoff, horizons, and FluSight output format used in
+  Activity 3.
+- Generate an improved forecast CSV and figures in step-specific
+  `output/data/05_improvements/` and `output/figures/05_improvements/`
+  folders.
+- Reuse the Activity 4 scoring approach to compare the improved model directly
+  against the original ARIMA model and simple baselines by horizon.
+- Report MAE, RMSE, WIS, coverage, and interval width. An improvement must be
+  judged by these held-out metrics, not by fit to the training data alone.
+
+## 3. Required Checks
+
+- Retain all parsing, date-class, weekly-spacing, no-look-ahead, quantile,
+  output-schema, and file-existence validations from Activities 3 and 4.
+- Print the model specification used at each reference-date fit and stop on
+  failed validations.
+- Do not overwrite baseline Activity 3 or Activity 4 outputs.
 
 
  

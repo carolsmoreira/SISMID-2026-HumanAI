@@ -150,8 +150,22 @@ last_fit <- NULL; last_train <- NULL; last_reference <- as.Date(NA)
 for (r_raw in reference_dates) {
   # Iterating over a Date vector drops its class; restore it explicitly.
   r <- as.Date(r_raw, origin = "1970-01-01")
+  # Construct all three calendar target endpoints from this reference date.
+  target_dates <- r + 7 * (1:3)
+  # Explicitly require a Date reference date, as specified in the Activity 3 slides.
+  if (!inherits(r, "Date")) stop("reference_date is not a Date at ", format(r))
+  # Explicitly require Date target endpoints rather than character or POSIXct values.
+  if (!inherits(target_dates, "Date")) stop("target_end_date is not a Date at ", format(r))
   # Select all information available on or before this reference date; this prevents leakage.
   train <- filter(df, week <= r) %>% arrange(week)
+  # Store the last training week so the no-look-ahead rule can be checked directly.
+  last_training_week <- max(train$week)
+  # Stop if any training value occurs after the reference date.
+  if (last_training_week > r) stop("Look-ahead leakage: training extends past reference_date at ", format(r))
+  # Stop if the latest training week is not strictly before every forecast target date.
+  if (last_training_week >= min(target_dates)) stop("Look-ahead leakage: training is not before target dates at ", format(r))
+  # Print the PowerPoint-required confirmation for dates and the no-leakage cutoff.
+  cat("[val] ref ", format(r), ": Date classes and no-look-ahead cutoff: OK\n", sep = "")
   # Recheck the weekly index inside each expanding training window.
   if (is.unsorted(train$week) || anyDuplicated(train$week) || any(diff(train$week) != 7)) stop("Invalid training-week index at ", format(r))
   # Extract the ordered admission counts as the univariate ARIMA response.
