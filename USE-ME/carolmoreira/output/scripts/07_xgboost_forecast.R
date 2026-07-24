@@ -63,6 +63,7 @@ comparison_csv <- "output/data/07_xgboost/xgboost_model_comparison_by_horizon.cs
 spec_csv <- "output/data/07_xgboost/xgboost_specification.csv"
 diagnostics_csv <- "output/data/07_xgboost/xgboost_diagnostics.csv"
 leading_diagnostics_csv <- "output/data/07_xgboost/xgboost_leading_diagnostics.csv"
+tuning_csv <- "output/data/07_xgboost/xgboost_hyperparameter_tuning.csv"
 
 forecast_png  <- "output/figures/07_xgboost/xgboost_forecast_vs_observed.png"
 leading_forecast_png <- "output/figures/07_xgboost/xgboost_leading_forecast_vs_observed.png"
@@ -71,6 +72,7 @@ width_png <- "output/figures/07_xgboost/xgboost_interval_widths.png"
 leading_width_png <- "output/figures/07_xgboost/xgboost_leading_interval_widths.png"
 feature_png <- "output/figures/07_xgboost/xgboost_feature_overview.png"
 leading_feature_png <- "output/figures/07_xgboost/xgboost_leading_feature_overview.png"
+tuning_png <- "output/figures/07_xgboost/xgboost_hyperparameter_tuning.png"
 
 dir.create(dirname(forecast_csv), recursive = TRUE, showWarnings = FALSE)
 dir.create(dirname(forecast_png), recursive = TRUE, showWarnings = FALSE)
@@ -285,26 +287,126 @@ quantile_ladder <- c(0.01, 0.025, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35,
 
 # ---- Rule 4X: XGBoost hyperparameters ----------------------------------------
 XGB_SEED   <- 42
-XGB_NROUND <- 300
-xgb_params <- list(
-  objective        = "reg:quantileerror",
-  quantile_alpha   = quantile_ladder,
-  eta              = 0.05,
-  max_depth        = 3,
-  subsample        = 0.8,
-  colsample_bytree = 0.8,
-  nthread          = 1,
-  seed             = XGB_SEED
+TUNING_GRID <- tibble::tribble(
+  ~eta, ~max_depth, ~subsample, ~colsample_bytree, ~nrounds,
+  0.03, 2L, 0.80, 0.80, 220L,
+  0.05, 3L, 0.80, 0.80, 300L,
+  0.08, 2L, 0.70, 0.70, 220L
 )
 set.seed(XGB_SEED)
+
+make_xgb_params <- function(eta, max_depth, subsample, colsample_bytree) {
+  list(
+    objective = "reg:quantileerror",
+    quantile_alpha = quantile_ladder,
+    eta = eta,
+    max_depth = max_depth,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    nthread = 1,
+    seed = XGB_SEED
+  )
+}
+
+rolling_validation_refs <- observed_weeks[
+  observed_weeks + 21 <= initial_train_end &
+    observed_weeks >= initial_train_end - 7 * 11
+]
+rolling_validation_refs <- tail(rolling_validation_refs, 8)
+if (length(rolling_validation_refs) < 4) stop("Not enough pre-test rolling validation dates for XGBoost tuning.")
+
+tune_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
+  tuning_rows <- list()
+  row_i <- 0L
+
+  for (grid_i in seq_len(nrow(TUNING_GRID))) {
+    params <- make_xgb_params(
+      eta = TUNING_GRID$eta[grid_i],
+      max_depth = TUNING_GRID$max_depth[grid_i],
+      subsample = TUNING_GRID$subsample[grid_i],
+      colsample_bytree = TUNING_GRID$colsample_bytree[grid_i]
+    )
+    nrounds <- TUNING_GRID$nrounds[grid_i]
+
+    for (r in rolling_validation_refs) {
+      rd <- as.Date(r, origin = "1970-01-01")
+      for (h in 1:3) {
+        target_end <- rd + 7 * h
+        cand_anchor <- df$week[df$week <= rd]
+        feat_all <- make_features_fn(cand_anchor, h)
+        y_target <- val_at(cand_anchor + 7 * h)
+        keep <- stats::complete.cases(feat_all) &
+          !is.na(y_target) &
+          (cand_anchor + 7 * h) <= rd
+        Xtr <- as.matrix(feat_all[keep, feature_names, drop = FALSE])
+        ytr <- y_target[keep]
+        Xpred <- as.matrix(make_features_fn(rd, h)[, feature_names, drop = FALSE])
+        observed <- val_at(target_end)
+
+        if (nrow(Xtr) < 30 || anyNA(Xtr) || anyNA(Xpred) || is.na(observed)) next
+
+        fit <- xgb.train(
+          params = params,
+          data = xgb.DMatrix(data = Xtr, label = ytr),
+          nrounds = nrounds,
+          verbose = 0
+        )
+        pred <- round(pmax(sort(as.numeric(predict(fit, Xpred))), 0))
+        if (length(pred) != length(quantile_ladder) || any(!is.finite(pred))) next
+
+        row_i <- row_i + 1L
+        tuning_rows[[row_i]] <- tibble::tibble(
+          model = model_label,
+          validation_reference_date = rd,
+          horizon = h,
+          eta = TUNING_GRID$eta[grid_i],
+          max_depth = TUNING_GRID$max_depth[grid_i],
+          subsample = TUNING_GRID$subsample[grid_i],
+          colsample_bytree = TUNING_GRID$colsample_bytree[grid_i],
+          nrounds = nrounds,
+          n_training_rows = nrow(Xtr),
+          observed = observed,
+          median = pred[which(quantile_ladder == 0.5)],
+          wis = scoringutils::wis(observed, matrix(pred, nrow = 1), quantile_ladder, count_median_twice = TRUE),
+          absolute_error = abs(pred[which(quantile_ladder == 0.5)] - observed)
+        )
+      }
+    }
+  }
+
+  tuning_results <- bind_rows(tuning_rows)
+  if (!nrow(tuning_results)) stop("No rolling validation tuning results for ", model_label)
+  selected <- tuning_results %>%
+    group_by(model, eta, max_depth, subsample, colsample_bytree, nrounds) %>%
+    summarise(mean_wis = mean(wis), mae = mean(absolute_error), n_validation_forecasts = n(), .groups = "drop") %>%
+    arrange(mean_wis, mae) %>%
+    slice(1)
+
+  list(results = tuning_results, selected = selected)
+}
+
+base_tuning <- tune_xgboost_variant("XGBoost quantile", make_base_features, BASE_FEATURE_NAMES)
+leading_tuning <- tune_xgboost_variant("XGBoost + leading indicators", make_leading_features, LEADING_FEATURE_NAMES)
+tuning_results <- bind_rows(base_tuning$results, leading_tuning$results)
+tuning_summary <- tuning_results %>%
+  group_by(model, eta, max_depth, subsample, colsample_bytree, nrounds) %>%
+  summarise(mean_wis = mean(wis), mae = mean(absolute_error), n_validation_forecasts = n(), .groups = "drop") %>%
+  arrange(model, mean_wis, mae)
+write_csv(tuning_summary, tuning_csv)
+
+selected_params <- bind_rows(base_tuning$selected, leading_tuning$selected)
+cat("[val] XGBoost hyperparameters selected by pre-test rolling validation:\n")
+print(selected_params)
 
 # ---- Rules 3X/4X/5X: fit per reference date x horizon, predict, reshape ------
 cat("\n--- Rule 4X & 5X validations ---\n")
 
-fit_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
+fit_xgboost_variant <- function(model_label, make_features_fn, feature_names, selected) {
   all_rows <- list()
   row_i <- 0
   diagnostic_rows <- list()
+  params <- make_xgb_params(selected$eta, selected$max_depth, selected$subsample, selected$colsample_bytree)
+  nrounds <- selected$nrounds
 
   for (r in reference_dates) {
     rd <- as.Date(r, origin = "1970-01-01")
@@ -333,8 +435,8 @@ fit_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
       if (length(unique(ytr)) <= 1) stop(paste0(model_label, ": response constant at ref ", format(rd, "%Y-%m-%d"), " h ", h))
 
       dtrain <- xgb.DMatrix(data = Xtr, label = ytr)
-      fit <- xgb.train(params = xgb_params, data = dtrain,
-                       nrounds = XGB_NROUND, verbose = 0)
+      fit <- xgb.train(params = params, data = dtrain,
+                       nrounds = nrounds, verbose = 0)
       if (is.null(fit)) stop(paste0(model_label, ": xgb.train returned NULL at ref ", format(rd, "%Y-%m-%d"), " h ", h))
 
       # Predict the 23 quantiles for the anchor = reference date.
@@ -365,11 +467,11 @@ fit_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
         target_end_date = target_end,
         min_training_target = min(cand_anchor[keep] + 7 * h),
         max_training_target = max(cand_anchor[keep] + 7 * h),
-        nrounds = XGB_NROUND,
-        eta = xgb_params$eta,
-        max_depth = xgb_params$max_depth,
-        subsample = xgb_params$subsample,
-        colsample_bytree = xgb_params$colsample_bytree,
+        nrounds = nrounds,
+        eta = params$eta,
+        max_depth = params$max_depth,
+        subsample = params$subsample,
+        colsample_bytree = params$colsample_bytree,
         features = paste(feature_names, collapse = "; "),
         stringsAsFactors = FALSE
       )
@@ -397,8 +499,8 @@ fit_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
   )
 }
 
-base_variant <- fit_xgboost_variant("XGBoost quantile", make_base_features, BASE_FEATURE_NAMES)
-leading_variant <- fit_xgboost_variant("XGBoost + leading indicators", make_leading_features, LEADING_FEATURE_NAMES)
+base_variant <- fit_xgboost_variant("XGBoost quantile", make_base_features, BASE_FEATURE_NAMES, base_tuning$selected)
+leading_variant <- fit_xgboost_variant("XGBoost + leading indicators", make_leading_features, LEADING_FEATURE_NAMES, leading_tuning$selected)
 
 forecasts <- base_variant$forecasts
 diagnostics <- base_variant$diagnostics
@@ -519,11 +621,12 @@ specification <- tibble::tibble(
   framing = "direct per horizon; three models per reference date",
   objective = "reg:quantileerror",
   quantile_levels = paste(quantile_ladder, collapse = ", "),
-  eta = xgb_params$eta,
-  max_depth = xgb_params$max_depth,
-  subsample = xgb_params$subsample,
-  colsample_bytree = xgb_params$colsample_bytree,
-  nrounds = XGB_NROUND,
+  tuning_design = paste0(length(rolling_validation_refs), " pre-test rolling reference dates x 3 horizons"),
+  eta = selected_params$eta,
+  max_depth = selected_params$max_depth,
+  subsample = selected_params$subsample,
+  colsample_bytree = selected_params$colsample_bytree,
+  nrounds = selected_params$nrounds,
   seed = XGB_SEED
 )
 write_csv(specification, spec_csv)
@@ -868,11 +971,29 @@ leading_feature_plot <- ggplot(leading_feature_data, aes(x = week, y = as.numeri
   theme(legend.position = "none")
 ggsave(leading_feature_png, leading_feature_plot, width = 10, height = 9, dpi = 300)
 
+tuning_plot <- tuning_summary %>%
+  mutate(
+    setting = paste0("eta=", eta, ", depth=", max_depth, ", rounds=", nrounds),
+    setting = reorder(setting, mean_wis)
+  ) %>%
+  ggplot(aes(x = mean_wis, y = setting, fill = model)) +
+  geom_col(position = position_dodge(width = .75), width = .65) +
+  labs(
+    x = "Mean rolling-validation WIS",
+    y = "Hyperparameter setting",
+    fill = "XGBoost variant",
+    title = "XGBoost Rolling Hyperparameter Validation",
+    subtitle = "Validation uses pre-test reference dates only; lower WIS is better."
+  ) +
+  theme_minimal()
+ggsave(tuning_png, tuning_plot, width = 10, height = 5.5, dpi = 300)
+
 expected_outputs <- c(forecast_csv, scores_csv, summary_csv, comparison_csv,
                       spec_csv, diagnostics_csv, leading_forecast_csv,
                       leading_scores_csv, leading_summary_csv, leading_diagnostics_csv,
                       forecast_png, leading_forecast_png, comparison_png,
-                      width_png, leading_width_png, feature_png, leading_feature_png)
+                      width_png, leading_width_png, feature_png, leading_feature_png,
+                      tuning_csv, tuning_png)
 if (!all(file.exists(expected_outputs))) {
   stop("One or more Activity 07 outputs were not written: ",
        paste(expected_outputs[!file.exists(expected_outputs)], collapse = ", "))

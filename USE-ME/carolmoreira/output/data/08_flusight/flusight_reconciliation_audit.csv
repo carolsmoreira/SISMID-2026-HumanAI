@@ -1,0 +1,7 @@
+check,status,detail
+nonnegative_values,OK,all forecast values are nonnegative
+integer_values,OK,all forecast values are integer counts
+monotone_quantiles,OK,quantiles are nondecreasing within each reference date and horizon
+target_dates,OK,target_end_date equals reference_date + 7 * horizon
+reasonable_horizon_median_growth,OK,34/34 reference dates pass median-growth diagnostic
+reasonable_horizon_width_growth,OK,34/34 reference dates pass width-growth diagnostic

@@ -79,6 +79,7 @@ comparison_csv <- "output/data/07_xgboost/xgboost_model_comparison_by_horizon.cs
 spec_csv <- "output/data/07_xgboost/xgboost_specification.csv"
 diagnostics_csv <- "output/data/07_xgboost/xgboost_diagnostics.csv"
 leading_diagnostics_csv <- "output/data/07_xgboost/xgboost_leading_diagnostics.csv"
+tuning_csv <- "output/data/07_xgboost/xgboost_hyperparameter_tuning.csv"
 
 forecast_png <- "output/figures/07_xgboost/xgboost_forecast_vs_observed.png"
 leading_forecast_png <- "output/figures/07_xgboost/xgboost_leading_forecast_vs_observed.png"
@@ -87,12 +88,14 @@ width_png <- "output/figures/07_xgboost/xgboost_interval_widths.png"
 leading_width_png <- "output/figures/07_xgboost/xgboost_leading_interval_widths.png"
 feature_png <- "output/figures/07_xgboost/xgboost_feature_overview.png"
 leading_feature_png <- "output/figures/07_xgboost/xgboost_leading_feature_overview.png"
+tuning_png <- "output/figures/07_xgboost/xgboost_hyperparameter_tuning.png"
 
 expected <- c(forecast_csv, scores_csv, summary_csv, comparison_csv,
               spec_csv, diagnostics_csv, leading_forecast_csv,
               leading_scores_csv, leading_summary_csv, leading_diagnostics_csv,
               forecast_png, leading_forecast_png, comparison_png,
-              width_png, leading_width_png, feature_png, leading_feature_png)
+              width_png, leading_width_png, feature_png, leading_feature_png,
+              tuning_csv, tuning_png)
 if (!all(file.exists(expected))) {
   stop("Missing Activity 07 output(s): ", paste(expected[!file.exists(expected)], collapse = ", "))
 }
@@ -107,9 +110,24 @@ first and second seasonal harmonics for the target MMWR week. The leading
 candidate additionally uses WVAL and NSSP values from six weeks before the
 target week.
 
+Hyperparameters are selected with a small rolling-validation grid using only
+pre-test reference dates. This avoids choosing XGBoost settings using the
+2025-26 evaluation outcomes.
+
 ```{r model-spec}
 read_csv(spec_csv, show_col_types = FALSE) %>%
   kable(caption = "XGBoost quantile model specification.")
+```
+
+```{r tuning-table}
+read_csv(tuning_csv, show_col_types = FALSE) %>%
+  mutate(across(c(mean_wis, mae), round, 3)) %>%
+  arrange(model, mean_wis) %>%
+  kable(caption = "Pre-test rolling-validation hyperparameter results.")
+```
+
+```{r tuning-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(tuning_png)))
 ```
 
 ```{r feature-plot, echo=FALSE, results='asis'}
@@ -219,6 +237,11 @@ this backtest, likely because the surveillance streams have a shorter aligned
 history and produced much wider intervals. This is still useful evidence: the
 leading signal is available, but it needs more careful regularization or a
 targeted ensemble before it should replace admissions-only XGBoost.
+
+After tuning, the selected settings are more regularized than the original
+fixed default: shallower trees with column and row subsampling. That improves
+the rigor of the comparison even when the final winner remains a horizon-level
+ensemble in Activity 08.
 
 ```{r strengths-weaknesses}
 tibble::tribble(

@@ -44,6 +44,8 @@ calibrated_forecast_csv <- "output/data/08_flusight/arimax_calibrated_flusight_f
 blend_forecast_csv <- "output/data/08_flusight/blend_calibrated_flusight_forecasts.csv"
 xgboost_blend_forecast_csv <- "output/data/08_flusight/xgboost_blend_flusight_forecasts.csv"
 horizon_specific_forecast_csv <- "output/data/08_flusight/horizon_specific_flusight_forecasts.csv"
+low_weight_leading_forecast_csv <- "output/data/08_flusight/xgboost_low_weight_leading_flusight_forecasts.csv"
+phase_calibrated_forecast_csv <- "output/data/08_flusight/phase_calibrated_horizon_specific_flusight_forecasts.csv"
 variant_scores_csv <- "output/data/08_flusight/arimax_extended_variant_scores.csv"
 variant_summary_csv <- "output/data/08_flusight/arimax_extended_variant_summary.csv"
 ranking_csv <- "output/data/08_flusight/flusight_model_ranking.csv"
@@ -51,6 +53,7 @@ final_forecast_csv <- "output/data/08_flusight/flusight_final_forecasts.csv"
 submission_dir <- "output/data/08_flusight/final_flusight_submission"
 submission_manifest_csv <- "output/data/08_flusight/final_flusight_submission_manifest.csv"
 compliance_audit_csv <- "output/data/08_flusight/flusight_compliance_audit.csv"
+reconciliation_audit_csv <- "output/data/08_flusight/flusight_reconciliation_audit.csv"
 
 stream_png <- "output/figures/08_flusight/surveillance_streams_overview.png"
 lag_png <- "output/figures/08_flusight/lagged_covariate_relationships.png"
@@ -387,6 +390,150 @@ combine_horizon_specific_forecasts <- function(horizon_sources, model_name) {
   combined
 }
 
+build_reference_phase_lookup <- function(truth_df) {
+  truth_df %>%
+    arrange(week) %>%
+    group_by(season) %>%
+    mutate(
+      previous_value = lag(value),
+      peak_so_far = cummax(value),
+      phase = case_when(
+        is.na(previous_value) ~ "early",
+        value >= 0.9 * peak_so_far & value >= previous_value ~ "growth_or_peak",
+        value < previous_value & value < peak_so_far ~ "decline",
+        TRUE ~ "plateau"
+      )
+    ) %>%
+    ungroup() %>%
+    select(reference_date = week, phase)
+}
+
+calibrate_forecast_intervals_by_phase <- function(fc, scored, truth_df, model_name,
+                                                  calibration_probability = 0.80,
+                                                  minimum_phase_errors = 4,
+                                                  minimum_horizon_errors = 6) {
+  phase_lookup <- build_reference_phase_lookup(truth_df)
+  wide <- fc %>%
+    pivot_wider(names_from = output_type_id, values_from = value, names_prefix = "q") %>%
+    left_join(phase_lookup, by = "reference_date") %>%
+    arrange(reference_date, horizon)
+  prior_error_data <- scored %>%
+    left_join(phase_lookup, by = "reference_date") %>%
+    mutate(
+      half_width_95 = pmax((upper_95 - lower_95) / 2, 1),
+      standardized_error_95 = abs(observed - median) / half_width_95
+    )
+
+  calibrated_rows <- vector("list", nrow(wide))
+  audit_rows <- vector("list", nrow(wide))
+  for (i in seq_len(nrow(wide))) {
+    current <- wide[i, ]
+    prior_same_phase <- prior_error_data %>%
+      filter(
+        horizon == current$horizon,
+        phase == current$phase,
+        target_end_date <= current$reference_date
+      )
+    prior_horizon <- prior_error_data %>%
+      filter(horizon == current$horizon, target_end_date <= current$reference_date)
+
+    if (nrow(prior_same_phase) >= minimum_phase_errors) {
+      prior_errors <- prior_same_phase
+      source <- "prior horizon-and-phase errors"
+    } else if (nrow(prior_horizon) >= minimum_horizon_errors) {
+      prior_errors <- prior_horizon
+      source <- "prior horizon errors"
+    } else {
+      prior_errors <- prior_horizon
+      source <- "insufficient prior errors"
+    }
+
+    multiplier <- if (nrow(prior_errors)) {
+      as.numeric(quantile(prior_errors$standardized_error_95,
+                          probs = calibration_probability,
+                          na.rm = TRUE, names = FALSE, type = 8))
+    } else {
+      1
+    }
+    multiplier <- min(max(multiplier, 0.75), 1.50)
+
+    adjusted <- current
+    median_value <- as.numeric(current$q0.5)
+    for (q_name in required_quantiles) {
+      if (q_name == "q0.5") {
+        adjusted[[q_name]] <- median_value
+      } else {
+        adjusted[[q_name]] <- round(pmax(median_value + multiplier * (as.numeric(current[[q_name]]) - median_value), 0))
+      }
+    }
+    adjusted[required_quantiles] <- as.list(cummax(as.numeric(adjusted[required_quantiles])))
+    calibrated_rows[[i]] <- adjusted
+    audit_rows[[i]] <- tibble(
+      model = model_name,
+      reference_date = current$reference_date,
+      horizon = current$horizon,
+      phase = current$phase,
+      n_prior_errors = nrow(prior_errors),
+      calibration_probability = calibration_probability,
+      interval_multiplier = multiplier,
+      calibration_source = source
+    )
+  }
+
+  calibrated_fc <- bind_rows(calibrated_rows) %>%
+    select(reference_date, target, horizon, target_end_date, location, output_type, all_of(required_quantiles)) %>%
+    pivot_longer(all_of(required_quantiles), names_to = "output_type_id", values_to = "value") %>%
+    mutate(output_type_id = as.numeric(sub("^q", "", output_type_id))) %>%
+    arrange(reference_date, horizon, output_type_id)
+
+  validate_flusight_quantiles(calibrated_fc, model_name, require_interval_widening = FALSE)
+  list(forecasts = calibrated_fc, audit = bind_rows(audit_rows))
+}
+
+write_reconciliation_audit <- function(fc, path) {
+  wide <- fc %>%
+    pivot_wider(names_from = output_type_id, values_from = value, names_prefix = "q") %>%
+    arrange(reference_date, horizon)
+  growth <- wide %>%
+    select(reference_date, horizon, median = q0.5, lower_95 = q0.025, upper_95 = q0.975) %>%
+    pivot_wider(names_from = horizon, values_from = c(median, lower_95, upper_95), names_sep = "_h") %>%
+    mutate(
+      h2_median_growth_ok = median_h2 <= pmax(4 * median_h1, median_h1 + 15000),
+      h3_median_growth_ok = median_h3 <= pmax(4 * median_h2, median_h2 + 15000),
+      h2_width_growth_ok = (upper_95_h2 - lower_95_h2) <= pmax(5 * (upper_95_h1 - lower_95_h1), (upper_95_h1 - lower_95_h1) + 25000),
+      h3_width_growth_ok = (upper_95_h3 - lower_95_h3) <= pmax(5 * (upper_95_h2 - lower_95_h2), (upper_95_h2 - lower_95_h2) + 25000)
+    )
+
+  checks <- tibble(
+    check = c(
+      "nonnegative_values",
+      "integer_values",
+      "monotone_quantiles",
+      "target_dates",
+      "reasonable_horizon_median_growth",
+      "reasonable_horizon_width_growth"
+    ),
+    status = c(
+      ifelse(all(fc$value >= 0), "OK", "FAIL"),
+      ifelse(all(fc$value == round(fc$value)), "OK", "FAIL"),
+      ifelse(all(wide %>% select(all_of(required_quantiles)) %>% apply(1, function(x) all(diff(as.numeric(x)) >= 0))), "OK", "FAIL"),
+      ifelse(all(fc$target_end_date == fc$reference_date + 7 * fc$horizon), "OK", "FAIL"),
+      ifelse(all(growth$h2_median_growth_ok & growth$h3_median_growth_ok), "OK", "DIAGNOSTIC"),
+      ifelse(all(growth$h2_width_growth_ok & growth$h3_width_growth_ok), "OK", "DIAGNOSTIC")
+    ),
+    detail = c(
+      "all forecast values are nonnegative",
+      "all forecast values are integer counts",
+      "quantiles are nondecreasing within each reference date and horizon",
+      "target_end_date equals reference_date + 7 * horizon",
+      paste0(sum(growth$h2_median_growth_ok & growth$h3_median_growth_ok), "/", nrow(growth), " reference dates pass median-growth diagnostic"),
+      paste0(sum(growth$h2_width_growth_ok & growth$h3_width_growth_ok), "/", nrow(growth), " reference dates pass width-growth diagnostic")
+    )
+  )
+  write_csv(checks, path)
+  checks
+}
+
 truth <- read_truth(cleaned_csv)
 wval <- read_wval(wval_csv)
 nssp <- read_nssp(nssp_csv)
@@ -673,6 +820,23 @@ if (file.exists(xgboost_leading_forecast_csv)) {
   forecast_tables[["xgboost_leading"]] <- xgboost_leading_fc
 }
 
+if (exists("xgboost_fc") && exists("xgboost_leading_fc")) {
+  low_weight_leading_fc <- blend_named_forecasts(
+    forecast_tables,
+    weights = c(xgboost = 0.85, xgboost_leading = 0.15),
+    model_name = "Blend: 85% XGBoost, 15% XGBoost-leading"
+  )
+  low_weight_leading_scored <- score_quantile_forecasts(
+    low_weight_leading_fc,
+    truth,
+    "Blend: 85% XGBoost, 15% XGBoost-leading"
+  )
+  write_csv(low_weight_leading_fc, low_weight_leading_forecast_csv)
+  comparison_models <- c(comparison_models, list(low_weight_leading_scored$summary))
+  variant_score_tables <- c(variant_score_tables, list(low_weight_leading_scored$scores))
+  forecast_tables[["blend_xgboost_low_weight_leading"]] <- low_weight_leading_fc
+}
+
 if (file.exists(ensemble_forecast_csv)) {
   ensemble_fc <- read_csv(ensemble_forecast_csv, show_col_types = FALSE) %>%
     mutate(
@@ -744,6 +908,23 @@ if (file.exists(ensemble_forecast_csv)) {
     comparison_models <- c(comparison_models, list(horizon_specific_scored$summary))
     variant_score_tables <- c(variant_score_tables, list(horizon_specific_scored$scores))
     forecast_tables[["horizon_specific_xgboost"]] <- horizon_specific_fc
+
+    phase_calibrated_horizon_specific <- calibrate_forecast_intervals_by_phase(
+      horizon_specific_fc,
+      horizon_specific_scored$scores,
+      truth,
+      "Phase-calibrated horizon-specific"
+    )
+    phase_calibrated_scored <- score_quantile_forecasts(
+      phase_calibrated_horizon_specific$forecasts,
+      truth,
+      "Phase-calibrated horizon-specific"
+    )
+    write_csv(phase_calibrated_horizon_specific$forecasts, phase_calibrated_forecast_csv)
+    write_csv(phase_calibrated_horizon_specific$audit, "output/data/08_flusight/phase_calibrated_horizon_specific_audit.csv")
+    comparison_models <- c(comparison_models, list(phase_calibrated_scored$summary))
+    variant_score_tables <- c(variant_score_tables, list(phase_calibrated_scored$scores))
+    forecast_tables[["phase_calibrated_horizon_specific"]] <- phase_calibrated_horizon_specific$forecasts
   }
 }
 
@@ -789,6 +970,12 @@ if (exists("xgboost_blend_fc")) {
 if (exists("horizon_specific_fc")) {
   forecast_by_model[["Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost"]] <- horizon_specific_fc
 }
+if (exists("low_weight_leading_fc")) {
+  forecast_by_model[["Blend: 85% XGBoost, 15% XGBoost-leading"]] <- low_weight_leading_fc
+}
+if (exists("phase_calibrated_horizon_specific")) {
+  forecast_by_model[["Phase-calibrated horizon-specific"]] <- phase_calibrated_horizon_specific$forecasts
+}
 
 if (!best_model %in% names(forecast_by_model)) stop("Best model forecast table is unavailable: ", best_model)
 
@@ -798,6 +985,7 @@ final_fc <- forecast_by_model[[best_model]] %>%
 
 final_interval_widening_ok <- validate_flusight_quantiles(final_fc, "Final FluSight", require_interval_widening = FALSE)
 write_csv(final_fc, final_forecast_csv)
+reconciliation_audit <- write_reconciliation_audit(final_fc, reconciliation_audit_csv)
 
 dir.create(submission_dir, recursive = TRUE, showWarnings = FALSE)
 submission_pattern <- "^\\d{4}-\\d{2}-\\d{2}-Carol-FluSight\\.csv$"
@@ -925,8 +1113,10 @@ if (exists("blended_fc")) {
     baseline_fc %>% filter(output_type_id == .5) %>% mutate(model = "Original ARIMA"),
     if (exists("xgboost_fc")) xgboost_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 7 XGBoost"),
     if (exists("xgboost_leading_fc")) xgboost_leading_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost + leading indicators"),
+    if (exists("low_weight_leading_fc")) low_weight_leading_fc %>% filter(output_type_id == .5) %>% mutate(model = "Low-weight leading blend"),
     if (exists("xgboost_blend_fc")) xgboost_blend_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost-weighted blend"),
-    if (exists("horizon_specific_fc")) horizon_specific_fc %>% filter(output_type_id == .5) %>% mutate(model = "Horizon-specific final")
+    if (exists("horizon_specific_fc")) horizon_specific_fc %>% filter(output_type_id == .5) %>% mutate(model = "Horizon-specific final"),
+    if (exists("phase_calibrated_horizon_specific")) phase_calibrated_horizon_specific$forecasts %>% filter(output_type_id == .5) %>% mutate(model = "Phase-calibrated final")
   ) %>%
     mutate(horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week")))
 
@@ -942,8 +1132,10 @@ if (exists("blended_fc")) {
                                   "Original ARIMA" = "#0072B2",
                                   "Activity 7 XGBoost" = "#E69F00",
                                   "XGBoost + leading indicators" = "#D55E00",
+                                  "Low-weight leading blend" = "#F0E442",
                                   "XGBoost-weighted blend" = "#000000",
-                                  "Horizon-specific final" = "#56B4E9")) +
+                                  "Horizon-specific final" = "#56B4E9",
+                                  "Phase-calibrated final" = "#999999")) +
     labs(
       x = "Target week",
       y = "Weekly influenza hospitalizations",
@@ -1046,9 +1238,11 @@ comparison_plot <- ggplot(comparison_plot_data, aes(x = horizon_label, y = value
                                "Activity 7 XGBoost + leading indicators" = "#D55E00",
                                "ARIMAX: surveillance + seasonal" = "#D55E00",
                                "Calibrated ARIMAX" = "#E69F00",
+                               "Blend: 85% XGBoost, 15% XGBoost-leading" = "#F0E442",
                                "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA" = "#CC79A7",
                                "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA" = "#000000",
                                "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost" = "#56B4E9",
+                               "Phase-calibrated horizon-specific" = "#999999",
                                "Calibrated blend" = "#999999")) +
   labs(
     x = "Forecast horizon",
@@ -1064,12 +1258,18 @@ expected_outputs <- c(
   forecast_csv, scores_csv, summary_csv, comparison_csv, stream_inventory_csv,
   spec_csv, calibrated_forecast_csv, variant_scores_csv, variant_summary_csv,
   ranking_csv, final_forecast_csv, submission_manifest_csv, compliance_audit_csv,
+  reconciliation_audit_csv,
   stream_png, lag_png, forecast_png, comparison_png, calibration_png,
   ranking_png, final_forecast_png
 )
 if (exists("blended_fc")) expected_outputs <- c(expected_outputs, blend_forecast_csv, blend_png)
 if (exists("xgboost_blend_fc")) expected_outputs <- c(expected_outputs, xgboost_blend_forecast_csv)
 if (exists("horizon_specific_fc")) expected_outputs <- c(expected_outputs, horizon_specific_forecast_csv)
+if (exists("low_weight_leading_fc")) expected_outputs <- c(expected_outputs, low_weight_leading_forecast_csv)
+if (exists("phase_calibrated_horizon_specific")) {
+  expected_outputs <- c(expected_outputs, phase_calibrated_forecast_csv,
+                        "output/data/08_flusight/phase_calibrated_horizon_specific_audit.csv")
+}
 if (!all(file.exists(expected_outputs))) stop("One or more ARIMAX outputs were not written.")
 
 cat("Activity 8 FluSight workflow complete.\n")

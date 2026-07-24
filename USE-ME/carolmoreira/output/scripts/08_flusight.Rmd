@@ -11,9 +11,10 @@ This activity turns the best-performing forecast from the expanded modeling
 work into a FluSight-ready product. The workflow is deliberately conservative:
 it preserves the Activity 3 reference dates, horizons, target definition, and
 quantile format; compares ARIMA, Activity 5, Activity 7 XGBoost, Activity 7
-XGBoost with leading indicators, ARIMAX, calibrated, blended, and
-horizon-specific candidates with held-out weighted interval score (WIS); and
-validates the final submission files before they are written.
+XGBoost with leading indicators, ARIMAX, calibrated, blended,
+horizon-specific, phase-calibrated, and reconciled candidates with held-out
+weighted interval score (WIS); and validates the final submission files before
+they are written.
 
 ```{r setup}
 knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
@@ -72,6 +73,7 @@ ranking_csv <- "output/data/08_flusight/flusight_model_ranking.csv"
 final_forecast_csv <- "output/data/08_flusight/flusight_final_forecasts.csv"
 submission_manifest_csv <- "output/data/08_flusight/final_flusight_submission_manifest.csv"
 compliance_audit_csv <- "output/data/08_flusight/flusight_compliance_audit.csv"
+reconciliation_audit_csv <- "output/data/08_flusight/flusight_reconciliation_audit.csv"
 
 stream_png <- "output/figures/08_flusight/surveillance_streams_overview.png"
 lag_png <- "output/figures/08_flusight/lagged_covariate_relationships.png"
@@ -83,6 +85,7 @@ calibration_png <- "output/figures/08_flusight/rolling_interval_calibration_mult
 
 expected <- c(truth_csv, inventory_csv, spec_csv, comparison_csv, ranking_csv,
               final_forecast_csv, submission_manifest_csv, compliance_audit_csv,
+              reconciliation_audit_csv,
               stream_png, lag_png, component_png, ranking_png, final_forecast_png,
               metric_png, calibration_png)
 if (!all(file.exists(expected))) {
@@ -133,9 +136,10 @@ The selected production forecast is the lowest mean WIS candidate across all
 scored reference dates and horizons. WIS is the primary ranking metric because
 it rewards both sharpness and calibration. The candidate set now includes a
 horizon-specific model that uses the XGBoost-weighted blend for horizon 1 and
-raw Activity 7 XGBoost for horizons 2 and 3, reflecting the observed
-horizon-level strengths. MAE and RMSE are shown as supporting central-forecast
-diagnostics, while coverage and interval width describe uncertainty behavior.
+raw Activity 7 XGBoost for horizons 2 and 3, a low-weight raw/leading XGBoost
+ensemble, and a phase-aware interval calibration candidate. MAE and RMSE are
+shown as supporting central-forecast diagnostics, while coverage and interval
+width describe uncertainty behavior.
 
 ```{r ranking-table}
 ranking <- read_csv(ranking_csv, show_col_types = FALSE)
@@ -183,6 +187,11 @@ horizon-wise interval widening is reported diagnostically rather than treated
 as a hard stop because direct per-horizon quantile models are not guaranteed to
 widen monotonically.
 
+The final refinement also adds phase-aware calibration. It estimates interval
+multipliers from prior realized errors with the same horizon and epidemic phase
+when enough historical examples are available, falling back to horizon-only
+history when the phase-specific sample is too small.
+
 ```{r calibration-plot, echo=FALSE, results='asis'}
 cat(sprintf('<img src="%s" width="100%%" />', normalizePath(calibration_png)))
 ```
@@ -210,6 +219,11 @@ cat(sprintf('<img src="%s" width="100%%" />', normalizePath(final_forecast_png))
 ```{r compliance}
 read_csv(compliance_audit_csv, show_col_types = FALSE) %>%
   kable(caption = "Automated compliance checks applied before final export.")
+```
+
+```{r reconciliation}
+read_csv(reconciliation_audit_csv, show_col_types = FALSE) %>%
+  kable(caption = "Forecast reconciliation diagnostics for the selected final model.")
 ```
 
 ```{r submission-manifest}
@@ -250,9 +264,15 @@ model_notes <- tibble::tribble(
   "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA",
   "Second-best overall WIS after adding Activity 7; strong coverage and best one-week WIS in this run.",
   "Did not beat raw XGBoost overall because the added components weakened longer-horizon sharpness.",
+  "Blend: 85% XGBoost, 15% XGBoost-leading",
+  "Uses leading indicators conservatively rather than giving them equal weight.",
+  "Still did not beat the horizon-specific final model by WIS.",
   "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost",
   "Uses the best observed one-week behavior from the XGBoost-weighted blend and the best longer-horizon behavior from Activity 7 XGBoost.",
   "More operationally complex because the production rule switches model source by horizon.",
+  "Phase-calibrated horizon-specific",
+  "Applies interval calibration by horizon and epidemic phase using prior errors only.",
+  "Reduced interval width but did not improve WIS enough to beat the uncalibrated horizon-specific model.",
   "Calibrated blend",
   "Most conservative blend-style uncertainty and better coverage.",
   "Too wide for the WIS objective in this evaluation window."
