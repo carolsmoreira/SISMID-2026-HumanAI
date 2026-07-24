@@ -2,10 +2,10 @@
 
 # Evaluate Activity 3 FluSight forecasts only where the target week is observed.
 suppressPackageStartupMessages({
-  required <- c("readr", "dplyr", "tidyr", "ggplot2")
+  required <- c("readr", "dplyr", "tidyr", "ggplot2", "scoringutils")
   missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing)) stop("Required R package(s) not installed: ", paste(missing, collapse = ", "))
-  library(readr); library(dplyr); library(tidyr); library(ggplot2)
+  library(readr); library(dplyr); library(tidyr); library(ggplot2); library(scoringutils)
 })
 
 truth_csv <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
@@ -48,36 +48,25 @@ wide <- scorable %>%
 required_quantiles <- c("q0.01", "q0.025", "q0.05", "q0.1", "q0.15", "q0.2", "q0.25", "q0.3", "q0.35", "q0.4", "q0.45", "q0.5", "q0.55", "q0.6", "q0.65", "q0.7", "q0.75", "q0.8", "q0.85", "q0.9", "q0.95", "q0.975", "q0.99")
 if (!all(required_quantiles %in% names(wide))) stop("Forecasts do not contain the full 23-quantile ladder")
 
-# WIS combines absolute median error with interval scores across all central intervals.
-levels <- c(98, 95, 90, 80, 70, 60, 50, 40, 30, 20, 10)
-lower_names <- c("q0.01", "q0.025", "q0.05", "q0.1", "q0.15", "q0.2", "q0.25", "q0.3", "q0.35", "q0.4", "q0.45")
-upper_names <- c("q0.99", "q0.975", "q0.95", "q0.9", "q0.85", "q0.8", "q0.75", "q0.7", "q0.65", "q0.6", "q0.55")
-alphas <- 1 - levels / 100
-
-# Calculate one WIS value per forecast instance using raw central-interval scores.
-wis <- numeric(nrow(wide))
-for (i in seq_len(nrow(wide))) {
-  interval_terms <- numeric(length(alphas))
-  for (j in seq_along(alphas)) {
-    lower <- wide[[lower_names[j]]][i]
-    upper <- wide[[upper_names[j]]][i]
-    y <- wide$observed[i]
-    interval_score <- (upper - lower) + (2 / alphas[j]) * max(lower - y, 0) + (2 / alphas[j]) * max(y - upper, 0)
-    interval_terms[j] <- (alphas[j] / 2) * interval_score
-  }
-  wis[i] <- (0.5 * abs(wide$q0.5[i] - wide$observed[i]) + sum(interval_terms)) / (0.5 + sum(alphas / 2))
-}
+# Calculate one WIS value per forecast instance using scoringutils.
+quantile_levels <- as.numeric(sub("^q", "", required_quantiles))
+quantile_predictions <- as.matrix(wide[, required_quantiles])
+wis <- scoringutils::wis(wide$observed, quantile_predictions, quantile_levels,
+                         count_median_twice = TRUE)
+absolute_error <- scoringutils::ae_median_quantile(wide$observed, quantile_predictions, quantile_levels)
+coverage_95 <- scoringutils::interval_coverage(wide$observed, quantile_predictions, quantile_levels,
+                                               interval_range = 95)
 
 # Create detailed scores for every scorable forecast, retaining 95% coverage and width.
 scores <- wide %>%
   transmute(reference_date, horizon, target_end_date, location, observed,
             median = q0.5,
-            absolute_error = abs(median - observed),
+            absolute_error = absolute_error,
             squared_error = (median - observed)^2,
             wis = wis,
             lower_95 = q0.025,
             upper_95 = q0.975,
-            coverage_95 = observed >= lower_95 & observed <= upper_95,
+            coverage_95 = coverage_95,
             width_95 = upper_95 - lower_95)
 
 # Summarize accuracy, probabilistic score, calibration, and sharpness by horizon.

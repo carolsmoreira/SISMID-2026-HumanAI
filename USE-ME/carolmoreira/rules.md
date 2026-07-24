@@ -417,7 +417,8 @@ when absent, at 300 DPI.
 # Activity 4: Evaluation
 
 Save evaluation code to `output/scripts/04_evaluation.R`. Create all missing
-output folders before writing files.
+output folders before writing files. Use the `scoringutils` package for
+quantile-forecast scoring metrics.
 
 ## 1. Input and Evaluation Set
 
@@ -435,9 +436,12 @@ output folders before writing files.
 
 - For each reference-date/horizon forecast, calculate median absolute error,
   squared error, 95% prediction-interval width, and 95% coverage using the
-  `0.025` and `0.975` quantiles.
-- Calculate the weighted interval score (WIS) across all 23 quantiles. Lower
-  WIS is better because it rewards accurate, sharp, calibrated forecasts.
+  `0.025` and `0.975` quantiles. Use
+  `scoringutils::ae_median_quantile()` for median absolute error and
+  `scoringutils::interval_coverage()` for 95% coverage.
+- Calculate the weighted interval score (WIS) across all 23 quantiles using
+  `scoringutils::wis()`. Lower WIS is better because it rewards accurate,
+  sharp, calibrated forecasts.
 - Summarize, separately for horizons 1, 2, and 3: number of scored forecasts,
   MAE, RMSE, mean WIS, 95% coverage, and mean 95% interval width.
 - Validate all input parsing, the required quantile ladder, existence of
