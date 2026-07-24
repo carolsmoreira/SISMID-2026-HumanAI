@@ -1,0 +1,210 @@
+---
+title: "Activity 07: XGBoost Quantile Forecast"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+Activity 07 tests an XGBoost quantile-regression alternative to the original
+ARIMA forecast. It keeps the same testing season, reference dates, horizons,
+target, location, and FluSight quantile ladder, but replaces `auto.arima()` with
+direct horizon-specific gradient-boosted trees.
+
+The model intentionally uses no wastewater, NSSP, or other leading indicators.
+Its inputs are lagged influenza admissions and deterministic target-week
+seasonal harmonics only. This makes it a clean machine-learning benchmark
+between the baseline ARIMA work and the later ARIMAX/blended models.
+
+```{r setup}
+knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
+
+find_project_dir <- function(start_dir = getwd()) {
+  candidates <- unique(c(
+    start_dir,
+    file.path(start_dir, "USE-ME", "carolmoreira"),
+    file.path(start_dir, ".."),
+    file.path(start_dir, "..", ".."),
+    file.path(start_dir, "..", "..", "..")
+  ))
+  candidates <- normalizePath(candidates, mustWork = FALSE)
+  candidates <- candidates[file.exists(file.path(candidates, "output/scripts/07_xgboost_forecast.R"))]
+  if (!length(candidates)) stop("Could not locate USE-ME/carolmoreira.")
+  candidates[1]
+}
+
+project_dir <- find_project_dir()
+knitr::opts_knit$set(root.dir = project_dir)
+if (!isTRUE(getOption("knitr.in.progress"))) setwd(project_dir)
+cat("Working directory:", project_dir, "\n")
+```
+
+## Run The Workflow
+
+The script below rebuilds the forecast, scores it, compares it with available
+benchmarks, and writes the figures used in this report.
+
+```{r run-script}
+source("output/scripts/07_xgboost_forecast.R")
+```
+
+## Load Outputs
+
+```{r packages}
+required <- c("readr", "dplyr", "tidyr", "ggplot2", "knitr")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Required R package(s) not installed: ", paste(missing, collapse = ", "))
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+```{r paths}
+forecast_csv <- "output/data/07_xgboost/xgboost_flusight_forecasts.csv"
+scores_csv <- "output/data/07_xgboost/xgboost_forecast_scores.csv"
+summary_csv <- "output/data/07_xgboost/xgboost_summary_by_horizon.csv"
+comparison_csv <- "output/data/07_xgboost/xgboost_model_comparison_by_horizon.csv"
+spec_csv <- "output/data/07_xgboost/xgboost_specification.csv"
+diagnostics_csv <- "output/data/07_xgboost/xgboost_diagnostics.csv"
+
+forecast_png <- "output/figures/07_xgboost/xgboost_forecast_vs_observed.png"
+comparison_png <- "output/figures/07_xgboost/xgboost_metric_comparison.png"
+width_png <- "output/figures/07_xgboost/xgboost_interval_widths.png"
+feature_png <- "output/figures/07_xgboost/xgboost_feature_overview.png"
+
+expected <- c(forecast_csv, scores_csv, summary_csv, comparison_csv,
+              spec_csv, diagnostics_csv, forecast_png, comparison_png,
+              width_png, feature_png)
+if (!all(file.exists(expected))) {
+  stop("Missing Activity 07 output(s): ", paste(expected[!file.exists(expected)], collapse = ", "))
+}
+```
+
+## Model Design
+
+XGBoost has no built-in autoregressive time-series structure, so the weekly
+series is converted into a supervised learning table. For each reference date
+and horizon, the model uses the last four known admissions values plus first
+and second seasonal harmonics for the target MMWR week.
+
+```{r model-spec}
+read_csv(spec_csv, show_col_types = FALSE) %>%
+  kable(caption = "XGBoost quantile model specification.")
+```
+
+```{r feature-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(feature_png)))
+```
+
+## No-Look-Ahead Framing
+
+The XGBoost model is fit directly by horizon. For a reference date `r` and
+horizon `h`, training examples use only anchor weeks whose observed target
+`t + 7h` is no later than `r`. Prediction uses the anchor week `r`, so all lag
+features are known at forecast time.
+
+```{r diagnostics}
+diagnostics <- read_csv(diagnostics_csv, show_col_types = FALSE)
+diagnostics %>%
+  group_by(horizon) %>%
+  summarise(
+    reference_dates = n(),
+    min_training_rows = min(n_training_rows),
+    max_training_rows = max(n_training_rows),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "Training row counts by direct forecast horizon.")
+```
+
+## FluSight Forecast Output
+
+Each reference date emits 69 rows: 3 horizons times 23 quantiles. Quantiles are
+clamped at zero, rounded to integer counts, sorted to prevent crossing, and
+validated against the FluSight date and ladder rules.
+
+```{r forecast-preview}
+forecasts <- read_csv(forecast_csv, show_col_types = FALSE)
+forecasts %>%
+  arrange(reference_date, horizon, output_type_id) %>%
+  head(12) %>%
+  kable(caption = "Preview of the Activity 07 FluSight-format XGBoost forecast.")
+```
+
+```{r forecast-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(forecast_png)))
+```
+
+## XGBoost Performance
+
+```{r summary-table}
+xgb_summary <- read_csv(summary_csv, show_col_types = FALSE)
+xgb_summary %>%
+  mutate(across(c(mae, rmse, mean_wis, coverage_95, mean_width_95), round, 3)) %>%
+  kable(caption = "XGBoost forecast performance by horizon.")
+```
+
+```{r width-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(width_png)))
+```
+
+## Comparison With Other Versions
+
+The comparison table includes the original ARIMA baseline, Activity 5 ensemble,
+and Activity 8 final blend when those outputs are available locally. XGBoost is
+not the best one-week model, but it performs strongly at two and three weeks
+ahead in this run.
+
+```{r comparison-table}
+comparison <- read_csv(comparison_csv, show_col_types = FALSE)
+comparison %>%
+  mutate(across(c(mae, rmse, mean_wis, coverage_95, mean_width_95), round, 3)) %>%
+  arrange(horizon, mean_wis) %>%
+  kable(caption = "Activity 07 XGBoost compared with available forecast versions.")
+```
+
+```{r comparison-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(comparison_png)))
+```
+
+## Interpretation
+
+XGBoost behaves differently from ARIMA-style models. It can learn nonlinear
+relationships between recent admissions, season timing, and future admissions,
+which helps at longer horizons here. The tradeoff is that it is less
+transparent, it does not guarantee horizon-wise interval widening, and its
+short-horizon forecast is less competitive than the blend and Activity 5
+ensemble.
+
+```{r strengths-weaknesses}
+tibble::tribble(
+  ~aspect, ~assessment,
+  "Strength",
+  "Strong two- and three-week WIS in this evaluation window.",
+  "Strength",
+  "Uses the exact same FluSight format and reference dates as the baseline.",
+  "Strength",
+  "Direct quantile regression allows asymmetric predictive distributions.",
+  "Weakness",
+  "No external leading indicators, so it cannot use wastewater or NSSP signal.",
+  "Weakness",
+  "Less interpretable than ARIMA or ARIMAX.",
+  "Weakness",
+  "Direct horizon models do not always produce intervals that widen monotonically."
+) %>%
+  kable(caption = "Summary of Activity 07 strengths and weaknesses.")
+```
+
+## Reproducibility Summary
+
+```{r reproducibility-summary}
+cat("Forecast CSV:", forecast_csv, "\n")
+cat("Scores CSV:", scores_csv, "\n")
+cat("Comparison CSV:", comparison_csv, "\n")
+cat("Rows in forecast:", nrow(forecasts), "\n")
+cat("Reference dates:", dplyr::n_distinct(forecasts$reference_date), "\n")
+cat("Rows per reference date:", nrow(forecasts) / dplyr::n_distinct(forecasts$reference_date), "\n")
+```
