@@ -43,6 +43,7 @@ spec_csv <- "output/data/08_flusight/arimax_specification.csv"
 calibrated_forecast_csv <- "output/data/08_flusight/arimax_calibrated_flusight_forecasts.csv"
 blend_forecast_csv <- "output/data/08_flusight/blend_calibrated_flusight_forecasts.csv"
 xgboost_blend_forecast_csv <- "output/data/08_flusight/xgboost_blend_flusight_forecasts.csv"
+horizon_specific_forecast_csv <- "output/data/08_flusight/horizon_specific_flusight_forecasts.csv"
 variant_scores_csv <- "output/data/08_flusight/arimax_extended_variant_scores.csv"
 variant_summary_csv <- "output/data/08_flusight/arimax_extended_variant_summary.csv"
 ranking_csv <- "output/data/08_flusight/flusight_model_ranking.csv"
@@ -367,6 +368,23 @@ blend_named_forecasts <- function(forecast_list, weights, model_name) {
     arrange(reference_date, horizon, output_type_id)
   validate_flusight_quantiles(blended, model_name, require_interval_widening = FALSE)
   blended
+}
+
+combine_horizon_specific_forecasts <- function(horizon_sources, model_name) {
+  required_horizons <- sort(unique(as.integer(names(horizon_sources))))
+  if (!identical(required_horizons, 1:3)) {
+    stop("Horizon-specific forecast must define horizons 1, 2, and 3.")
+  }
+
+  combined <- bind_rows(lapply(names(horizon_sources), function(horizon_name) {
+    horizon_sources[[horizon_name]] %>%
+      filter(horizon == as.integer(horizon_name))
+  })) %>%
+    select(reference_date, target, horizon, target_end_date, location, output_type, output_type_id, value) %>%
+    arrange(reference_date, horizon, output_type_id)
+
+  validate_flusight_quantiles(combined, model_name, require_interval_widening = FALSE)
+  combined
 }
 
 truth <- read_truth(cleaned_csv)
@@ -712,6 +730,20 @@ if (file.exists(ensemble_forecast_csv)) {
     comparison_models <- c(comparison_models, list(xgboost_blend_scored$summary))
     variant_score_tables <- c(variant_score_tables, list(xgboost_blend_scored$scores))
     forecast_tables[["blend_xgboost_arimax_ensemble_arima"]] <- xgboost_blend_fc
+
+    horizon_specific_fc <- combine_horizon_specific_forecasts(
+      list(`1` = xgboost_blend_fc, `2` = xgboost_fc, `3` = xgboost_fc),
+      model_name = "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost"
+    )
+    horizon_specific_scored <- score_quantile_forecasts(
+      horizon_specific_fc,
+      truth,
+      "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost"
+    )
+    write_csv(horizon_specific_fc, horizon_specific_forecast_csv)
+    comparison_models <- c(comparison_models, list(horizon_specific_scored$summary))
+    variant_score_tables <- c(variant_score_tables, list(horizon_specific_scored$scores))
+    forecast_tables[["horizon_specific_xgboost"]] <- horizon_specific_fc
   }
 }
 
@@ -753,6 +785,9 @@ if (exists("blended_fc")) forecast_by_model[["Blend: 50% ARIMAX, 25% ensemble, 2
 if (exists("calibrated_blend")) forecast_by_model[["Calibrated blend"]] <- calibrated_blend$forecasts
 if (exists("xgboost_blend_fc")) {
   forecast_by_model[["Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA"]] <- xgboost_blend_fc
+}
+if (exists("horizon_specific_fc")) {
+  forecast_by_model[["Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost"]] <- horizon_specific_fc
 }
 
 if (!best_model %in% names(forecast_by_model)) stop("Best model forecast table is unavailable: ", best_model)
@@ -890,7 +925,8 @@ if (exists("blended_fc")) {
     baseline_fc %>% filter(output_type_id == .5) %>% mutate(model = "Original ARIMA"),
     if (exists("xgboost_fc")) xgboost_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 7 XGBoost"),
     if (exists("xgboost_leading_fc")) xgboost_leading_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost + leading indicators"),
-    if (exists("xgboost_blend_fc")) xgboost_blend_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost-weighted blend")
+    if (exists("xgboost_blend_fc")) xgboost_blend_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost-weighted blend"),
+    if (exists("horizon_specific_fc")) horizon_specific_fc %>% filter(output_type_id == .5) %>% mutate(model = "Horizon-specific final")
   ) %>%
     mutate(horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week")))
 
@@ -906,7 +942,8 @@ if (exists("blended_fc")) {
                                   "Original ARIMA" = "#0072B2",
                                   "Activity 7 XGBoost" = "#E69F00",
                                   "XGBoost + leading indicators" = "#D55E00",
-                                  "XGBoost-weighted blend" = "#000000")) +
+                                  "XGBoost-weighted blend" = "#000000",
+                                  "Horizon-specific final" = "#56B4E9")) +
     labs(
       x = "Target week",
       y = "Weekly influenza hospitalizations",
@@ -1011,6 +1048,7 @@ comparison_plot <- ggplot(comparison_plot_data, aes(x = horizon_label, y = value
                                "Calibrated ARIMAX" = "#E69F00",
                                "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA" = "#CC79A7",
                                "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA" = "#000000",
+                               "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost" = "#56B4E9",
                                "Calibrated blend" = "#999999")) +
   labs(
     x = "Forecast horizon",
@@ -1031,6 +1069,7 @@ expected_outputs <- c(
 )
 if (exists("blended_fc")) expected_outputs <- c(expected_outputs, blend_forecast_csv, blend_png)
 if (exists("xgboost_blend_fc")) expected_outputs <- c(expected_outputs, xgboost_blend_forecast_csv)
+if (exists("horizon_specific_fc")) expected_outputs <- c(expected_outputs, horizon_specific_forecast_csv)
 if (!all(file.exists(expected_outputs))) stop("One or more ARIMAX outputs were not written.")
 
 cat("Activity 8 FluSight workflow complete.\n")

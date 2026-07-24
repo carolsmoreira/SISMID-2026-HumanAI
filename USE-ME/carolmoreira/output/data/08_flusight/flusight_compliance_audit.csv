@@ -9,5 +9,5 @@ horizons_are_1_2_3,OK,"exactly 1, 2, and 3"
 rows_per_reference_date,OK,69 rows per reference date: 3 horizons x 23 quantiles
 intervals_widen_with_horizon,DIAGNOSTIC,diagnostic only for selected direct/hybrid model; not a FluSight schema requirement
 one_submission_file_per_reference_date,OK,34 files written
-selected_by_lowest_mean_wis,OK,Activity 7 XGBoost
+selected_by_lowest_mean_wis,OK,"Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost"
 causal_post_peak_feature,OK,"post_peak_decline uses peak_seen_before, then a six-week lag"

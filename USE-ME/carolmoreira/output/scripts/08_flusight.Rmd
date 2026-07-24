@@ -11,9 +11,9 @@ This activity turns the best-performing forecast from the expanded modeling
 work into a FluSight-ready product. The workflow is deliberately conservative:
 it preserves the Activity 3 reference dates, horizons, target definition, and
 quantile format; compares ARIMA, Activity 5, Activity 7 XGBoost, Activity 7
-XGBoost with leading indicators, ARIMAX, calibrated, and blended candidates
-with held-out weighted interval score (WIS); and validates the final submission
-files before they are written.
+XGBoost with leading indicators, ARIMAX, calibrated, blended, and
+horizon-specific candidates with held-out weighted interval score (WIS); and
+validates the final submission files before they are written.
 
 ```{r setup}
 knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
@@ -131,9 +131,11 @@ read_csv(spec_csv, show_col_types = FALSE) %>%
 
 The selected production forecast is the lowest mean WIS candidate across all
 scored reference dates and horizons. WIS is the primary ranking metric because
-it rewards both sharpness and calibration. MAE and RMSE are shown as supporting
-central-forecast diagnostics, while coverage and interval width describe
-uncertainty behavior.
+it rewards both sharpness and calibration. The candidate set now includes a
+horizon-specific model that uses the XGBoost-weighted blend for horizon 1 and
+raw Activity 7 XGBoost for horizons 2 and 3, reflecting the observed
+horizon-level strengths. MAE and RMSE are shown as supporting central-forecast
+diagnostics, while coverage and interval width describe uncertainty behavior.
 
 ```{r ranking-table}
 ranking <- read_csv(ranking_csv, show_col_types = FALSE)
@@ -248,6 +250,9 @@ model_notes <- tibble::tribble(
   "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA",
   "Second-best overall WIS after adding Activity 7; strong coverage and best one-week WIS in this run.",
   "Did not beat raw XGBoost overall because the added components weakened longer-horizon sharpness.",
+  "Horizon-specific: h1 XGBoost blend, h2-h3 XGBoost",
+  "Uses the best observed one-week behavior from the XGBoost-weighted blend and the best longer-horizon behavior from Activity 7 XGBoost.",
+  "More operationally complex because the production rule switches model source by horizon.",
   "Calibrated blend",
   "Most conservative blend-style uncertainty and better coverage.",
   "Too wide for the WIS objective in this evaluation window."
