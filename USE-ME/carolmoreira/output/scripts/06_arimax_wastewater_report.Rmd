@@ -1,0 +1,582 @@
+---
+title: "Activity 6: Wastewater and Surveillance ARIMAX"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+This report summarizes and extends the ARIMAX workflow that uses upstream
+Activity 5 data streams to inform the influenza hospitalization forecasts. The
+progression is:
+
+- Inventory the streams available in the original repo.
+- Compare lagged wastewater and syndromic signals against admissions.
+- Screen leakage-free ARIMAX variants across covariate sets and lags.
+- Compare the selected ARIMAX candidate against the original ARIMA and Activity
+  5 ensemble forecasts.
+
+```{r setup}
+knitr::opts_chunk$set(message = FALSE, warning = TRUE)
+
+find_project_dir <- function(start_dir = getwd()) {
+  candidates <- unique(c(
+    start_dir,
+    file.path(start_dir, "USE-ME", "carolmoreira"),
+    file.path(start_dir, ".."),
+    file.path(start_dir, "..", ".."),
+    file.path(start_dir, "..", "..", "..")
+  ))
+  candidates <- normalizePath(candidates, mustWork = FALSE)
+  candidates <- candidates[file.exists(file.path(candidates, "output/scripts/06_arimax_wastewater.R"))]
+  if (!length(candidates)) stop("Could not locate USE-ME/carolmoreira.")
+  candidates[1]
+}
+
+project_dir <- find_project_dir()
+knitr::opts_knit$set(root.dir = project_dir)
+if (!isTRUE(getOption("knitr.in.progress"))) setwd(project_dir)
+cat("Working directory:", project_dir, "\n")
+```
+
+## Load Outputs
+
+```{r packages}
+required <- c("readr", "dplyr", "tidyr", "ggplot2", "knitr", "forecast")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Required R package(s) not installed: ", paste(missing, collapse = ", "))
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(forecast)
+```
+
+```{r paths}
+script_path <- "output/scripts/06_arimax_wastewater.R"
+truth_csv <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+wval_csv <- "data/NWSSWVALNational.csv"
+nssp_csv <- "data/NSSPNational.csv"
+inventory_csv <- "output/data/06_arimax/upstream_data_stream_inventory.csv"
+spec_csv <- "output/data/06_arimax/arimax_specification.csv"
+comparison_csv <- "output/data/06_arimax/arimax_model_comparison_by_horizon.csv"
+scores_csv <- "output/data/06_arimax/arimax_forecast_scores.csv"
+variant_scores_csv <- "output/data/06_arimax/arimax_extended_variant_scores.csv"
+variant_summary_csv <- "output/data/06_arimax/arimax_extended_variant_summary.csv"
+lag_grid_scores_csv <- "output/data/06_arimax/arimax_lag_grid_scores.csv"
+lag_grid_summary_csv <- "output/data/06_arimax/arimax_lag_grid_summary.csv"
+
+stream_png <- "output/figures/06_arimax/surveillance_streams_overview.png"
+lag_png <- "output/figures/06_arimax/lagged_covariate_relationships.png"
+forecast_png <- "output/figures/06_arimax/arimax_forecast_vs_observed.png"
+comparison_png <- "output/figures/06_arimax/arimax_metric_comparison.png"
+lag_grid_png <- "output/figures/06_arimax/arimax_lag_grid_progression.png"
+best_variant_png <- "output/figures/06_arimax/arimax_best_variant_by_horizon.png"
+calibration_png <- "output/figures/06_arimax/rolling_interval_calibration_multipliers.png"
+blend_png <- "output/figures/06_arimax/blend_vs_component_medians.png"
+
+expected <- c(script_path, inventory_csv, spec_csv, comparison_csv, scores_csv,
+              variant_scores_csv, variant_summary_csv,
+              stream_png, lag_png, forecast_png, comparison_png,
+              calibration_png, blend_png)
+if (!all(file.exists(expected))) {
+  missing_files <- expected[!file.exists(expected)]
+  stop("Missing ARIMAX output(s): ", paste(missing_files, collapse = ", "))
+}
+
+stream_png_abs <- normalizePath(stream_png)
+lag_png_abs <- normalizePath(lag_png)
+forecast_png_abs <- normalizePath(forecast_png)
+comparison_png_abs <- normalizePath(comparison_png)
+calibration_png_abs <- normalizePath(calibration_png)
+blend_png_abs <- normalizePath(blend_png)
+```
+
+## Available Streams
+
+```{r stream-inventory}
+inventory <- read_csv(inventory_csv, show_col_types = FALSE)
+inventory %>%
+  kable(caption = "Upstream data streams copied into the learner workspace.")
+```
+
+```{r stream-overview, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', stream_png_abs))
+```
+
+## Model Design
+
+The selected ARIMAX model now uses surveillance and seasonal regressors:
+
+- NWSS national influenza A wastewater viral activity level.
+- NSSP smoothed influenza emergency-department visit percentage.
+- MMWR week sine/cosine seasonality.
+- Weeks since season start.
+- Lagged current-season cumulative admissions.
+- Lagged post-peak decline indicator.
+
+The surveillance and outcome-derived state variables are lagged according to the
+specification table. Deterministic timing variables use the known target week.
+
+```{r model-spec}
+spec <- read_csv(spec_csv, show_col_types = FALSE)
+selected_lag_weeks <- spec$regressor_lag_weeks[1]
+spec %>% kable(caption = "ARIMAX specification.")
+```
+
+```{r lag-relationships, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', lag_png_abs))
+```
+
+## Improvement Progression
+
+The first ARIMAX pass used both WVAL and NSSP at a fixed 3-week lag. To make the
+model more defensible, this section screens a small set of leakage-free variants
+and then updates the full quantile ARIMAX model to the best practical lag:
+
+- WVAL only.
+- NSSP only.
+- WVAL plus NSSP.
+- Lags 3, 4, 5, and 6 weeks.
+
+Lags shorter than 3 weeks are intentionally excluded. With 1-, 2-, and
+3-week-ahead forecasts, a 1- or 2-week lag would require covariate values dated
+after the reference date for some horizons. That would leak future information.
+
+```{r progression-data-prep}
+# Load the target and external streams exactly as the ARIMAX script does. This
+# chunk is kept explicit so the lag-screening assumptions are visible in the
+# report rather than hidden in a helper script.
+truth <- read_csv(truth_csv, show_col_types = FALSE) %>%
+  transmute(
+    week = as.Date(week),
+    location = as.character(location),
+    observed = as.numeric(value)
+  ) %>%
+  arrange(week)
+
+wval <- read_csv(wval_csv, show_col_types = FALSE) %>%
+  filter(`Pathogen Target` == "Influenza A virus") %>%
+  transmute(
+    week = as.Date(`Week End`, format = "%m/%d/%Y"),
+    wval = as.numeric(`National WVAL`)
+  ) %>%
+  distinct(week, .keep_all = TRUE) %>%
+  arrange(week)
+
+nssp <- read_csv(nssp_csv, show_col_types = FALSE) %>%
+  filter(geography == "United States") %>%
+  transmute(
+    week = as.Date(week_end, format = "%m/%d/%Y"),
+    nssp_flu = as.numeric(percent_visits_smoothed_influenza)
+  ) %>%
+  distinct(week, .keep_all = TRUE) %>%
+  arrange(week)
+
+if (anyNA(truth$week) || anyNA(truth$observed)) stop("Truth data did not parse.")
+if (anyNA(wval$week) || anyNA(wval$wval)) stop("WVAL data did not parse.")
+if (anyNA(nssp$week)) stop("NSSP dates did not parse.")
+
+# Use the same reference dates already emitted by the full ARIMAX forecast. This
+# guarantees that every screened variant is evaluated on the same forecast tasks.
+arimax_scores <- read_csv(scores_csv, show_col_types = FALSE) %>%
+  mutate(reference_date = as.Date(reference_date),
+         target_end_date = as.Date(target_end_date))
+reference_dates <- sort(unique(arimax_scores$reference_date))
+
+wval_lookup <- setNames(wval$wval, as.character(wval$week))
+nssp_lookup <- setNames(nssp$nssp_flu, as.character(nssp$week))
+
+make_design <- function(lag_weeks) {
+  truth %>%
+    mutate(
+      wval = as.numeric(wval_lookup[as.character(week - 7 * lag_weeks)]),
+      nssp_flu = as.numeric(nssp_lookup[as.character(week - 7 * lag_weeks)])
+    ) %>%
+    arrange(week)
+}
+
+variant_grid <- tidyr::crossing(
+  covariate_set = c("WVAL only", "NSSP only", "WVAL + NSSP"),
+  lag_weeks = 3:6
+)
+
+variant_grid %>%
+  kable(caption = "Leakage-free ARIMAX variants screened before choosing a final model.")
+```
+
+```{r progression-screening-functions}
+# Fit an expanding-window ARIMAX model for one covariate set and lag. This is a
+# point-forecast screening step: it compares forecast medians quickly before
+# spending report space on the full quantile forecast for the selected candidate.
+evaluate_arimax_variant <- function(covariate_set, lag_weeks) {
+  design <- make_design(lag_weeks)
+  xreg_cols <- switch(
+    covariate_set,
+    "WVAL only" = "wval",
+    "NSSP only" = "nssp_flu",
+    "WVAL + NSSP" = c("wval", "nssp_flu"),
+    stop("Unknown covariate set: ", covariate_set)
+  )
+
+  rows <- vector("list", length(reference_dates) * 3)
+  row_i <- 0L
+
+  for (r_raw in reference_dates) {
+    r <- as.Date(r_raw, origin = "1970-01-01")
+    target_dates <- r + 7 * (1:3)
+
+    # The lag rule guarantees every xreg for target_dates is dated on or before
+    # the reference date. This explicit check protects the comparison if someone
+    # later expands the lag grid.
+    xreg_dates <- target_dates - 7 * lag_weeks
+    if (any(xreg_dates > r)) {
+      stop("Leakage detected for ", covariate_set, " lag ", lag_weeks,
+           " at reference date ", format(r))
+    }
+
+    train <- design %>%
+      filter(week <= r) %>%
+      filter(if_all(all_of(xreg_cols), ~!is.na(.x))) %>%
+      arrange(week)
+    future_x <- design %>%
+      filter(week %in% target_dates) %>%
+      arrange(week)
+
+    if (nrow(train) < 52 || nrow(future_x) != 3 ||
+        anyNA(future_x[, xreg_cols, drop = FALSE])) {
+      next
+    }
+
+    train_x <- as.matrix(train[, xreg_cols, drop = FALSE])
+    future_x_matrix <- as.matrix(future_x[, xreg_cols, drop = FALSE])
+
+    fit <- forecast::auto.arima(as.numeric(train$observed), xreg = train_x)
+    fc <- forecast::forecast(fit, h = 3, xreg = future_x_matrix)
+
+    observed_lookup <- setNames(truth$observed, as.character(truth$week))
+    for (h in 1:3) {
+      target_date <- target_dates[h]
+      observed <- as.numeric(observed_lookup[as.character(target_date)])
+      if (is.na(observed)) next
+
+      row_i <- row_i + 1L
+      rows[[row_i]] <- tibble(
+        covariate_set = covariate_set,
+        lag_weeks = lag_weeks,
+        reference_date = r,
+        horizon = h,
+        target_end_date = target_date,
+        observed = observed,
+        median = as.numeric(fc$mean[h]),
+        absolute_error = abs(median - observed),
+        squared_error = (median - observed)^2
+      )
+    }
+  }
+
+  bind_rows(rows)
+}
+```
+
+```{r progression-screening-run}
+# Run the grid once, then reuse the saved CSVs on later renders. The grid
+# requires hundreds of rolling ARIMAX fits, so caching keeps the report usable
+# while preserving the full progression.
+if (file.exists(lag_grid_scores_csv) && file.exists(lag_grid_summary_csv)) {
+  lag_grid_scores <- read_csv(lag_grid_scores_csv, show_col_types = FALSE) %>%
+    mutate(reference_date = as.Date(reference_date),
+           target_end_date = as.Date(target_end_date))
+  lag_grid_summary <- read_csv(lag_grid_summary_csv, show_col_types = FALSE)
+} else {
+  lag_grid_scores <- lapply(seq_len(nrow(variant_grid)), function(i) {
+    evaluate_arimax_variant(variant_grid$covariate_set[i], variant_grid$lag_weeks[i])
+  }) %>%
+    bind_rows()
+
+  if (!nrow(lag_grid_scores)) stop("No ARIMAX lag-grid variants were scorable.")
+
+  lag_grid_summary <- lag_grid_scores %>%
+    group_by(covariate_set, lag_weeks, horizon) %>%
+    summarise(
+      n_forecasts = n(),
+      mae = mean(absolute_error),
+      rmse = sqrt(mean(squared_error)),
+      .groups = "drop"
+    ) %>%
+    arrange(horizon, mae)
+
+  write_csv(lag_grid_scores, lag_grid_scores_csv)
+  write_csv(lag_grid_summary, lag_grid_summary_csv)
+}
+
+lag_grid_summary %>%
+  mutate(mae = round(mae, 1), rmse = round(rmse, 1)) %>%
+  kable(caption = "Median forecast screening results for leakage-free ARIMAX variants.")
+```
+
+```{r progression-screening-plots}
+# Plot 1: how MAE changes as the lag length changes. This reveals whether the
+# fixed 3-week lag is competitive or whether a slower signal is better.
+lag_grid_plot <- ggplot(lag_grid_summary,
+                        aes(x = lag_weeks, y = mae, color = covariate_set)) +
+  geom_line(linewidth = .8) +
+  geom_point(size = 2) +
+  facet_wrap(~horizon, scales = "free_y",
+             labeller = labeller(horizon = function(x) paste(x, "week ahead"))) +
+  scale_color_manual(values = c("WVAL only" = "#0072B2",
+                                "NSSP only" = "#D55E00",
+                                "WVAL + NSSP" = "#009E73")) +
+  labs(
+    x = "Lag in weeks",
+    y = "Mean absolute error",
+    color = "Covariates",
+    title = "ARIMAX Lag and Covariate Progression",
+    subtitle = "Lower MAE is better; all variants use only covariates available by the reference date."
+  ) +
+  theme_minimal()
+ggsave(lag_grid_png, lag_grid_plot, width = 11, height = 7, dpi = 300)
+
+# Plot 2: best screened variant within each horizon. This makes the tradeoff
+# clear when different horizons prefer different signals or lags.
+best_by_horizon <- lag_grid_summary %>%
+  group_by(horizon) %>%
+  slice_min(mae, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(variant = paste0(covariate_set, ", lag ", lag_weeks))
+
+best_variant_plot <- ggplot(best_by_horizon,
+                            aes(x = factor(horizon), y = mae, fill = variant)) +
+  geom_col(width = .65) +
+  geom_text(aes(label = round(mae, 0)), vjust = -.35, size = 3.5) +
+  labs(
+    x = "Forecast horizon",
+    y = "Mean absolute error",
+    fill = "Best screened variant",
+    title = "Best ARIMAX Screening Variant by Horizon",
+    subtitle = "This screening step optimizes median accuracy only; final model choice should also consider WIS and interval width."
+  ) +
+  theme_minimal()
+ggsave(best_variant_png, best_variant_plot, width = 10, height = 6, dpi = 300)
+
+lag_grid_plot
+best_variant_plot
+```
+
+```{r progression-recommendation}
+# Summarize the progression in a compact table. The selected full-quantile
+# ARIMAX uses WVAL + NSSP at the lag stored in arimax_specification.csv.
+current_screened <- lag_grid_summary %>%
+  filter(covariate_set == "WVAL + NSSP", lag_weeks == selected_lag_weeks) %>%
+  mutate(candidate = "Selected full ARIMAX")
+
+best_screened <- lag_grid_summary %>%
+  group_by(horizon) %>%
+  slice_min(mae, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(candidate = "Best median-screened variant")
+
+progression_recommendation <- bind_rows(current_screened, best_screened) %>%
+  select(candidate, horizon, covariate_set, lag_weeks, n_forecasts, mae, rmse) %>%
+  arrange(horizon, candidate)
+
+progression_recommendation %>%
+  mutate(mae = round(mae, 1), rmse = round(rmse, 1)) %>%
+  kable(caption = "Current ARIMAX candidate versus the best median-screened variant.")
+```
+
+## Model Extensions
+
+## Seasonal Features
+
+The seasonal features were added as a structured way to expose epidemic timing
+to ARIMAX. Two features are deterministic for the target date: MMWR sine/cosine
+and weeks since season start. Two features are lagged so they remain available
+at forecast time: cumulative current-season admissions and post-peak decline.
+
+This matters because the seasonal feature set improves some uncertainty and
+shape behavior, but in this run it worsens median accuracy for the standalone
+ARIMAX. The model comparison below therefore keeps both the seasonal ARIMAX and
+the blended models visible.
+
+## Rolling Interval Calibration
+
+The calibrated variants estimate interval widening from prior forecast errors
+within the same horizon. For a forecast issued at reference date `r`, only
+errors with `target_end_date <= r` are eligible. This preserves the real-time
+forecasting rule.
+
+```{r calibration-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', calibration_png_abs))
+```
+
+## Blended Forecast
+
+The blend uses the requested weights:
+
+- 50% ARIMAX median/distribution.
+- 25% Activity 5 ensemble.
+- 25% original ARIMA.
+
+The blend is also interval-calibrated as a separate candidate. Direct blending
+reduces the risk that a richer ARIMAX overreacts to noisy covariates while still
+letting wastewater, NSSP, and seasonal features influence the final forecast.
+
+```{r blend-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', blend_png_abs))
+```
+
+## Forecasts
+
+```{r forecast-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', forecast_png_abs))
+```
+
+## Evaluation
+
+```{r comparison-table}
+comparison <- read_csv(comparison_csv, show_col_types = FALSE)
+comparison %>%
+  mutate(
+    mae = round(mae, 1),
+    rmse = round(rmse, 1),
+    mean_wis = round(mean_wis, 1),
+    coverage_95 = paste0(round(100 * coverage_95, 1), "%"),
+    mean_width_95 = round(mean_width_95, 1)
+  ) %>%
+  kable(caption = "Original ARIMA, Activity 5 ensemble, ARIMAX, calibrated, and blended variants by horizon.")
+```
+
+```{r comparison-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', comparison_png_abs))
+```
+
+## Score Detail
+
+```{r score-detail}
+scores <- read_csv(variant_scores_csv, show_col_types = FALSE)
+scores %>%
+  arrange(desc(absolute_error)) %>%
+  select(model, reference_date, horizon, target_end_date, observed, median,
+         absolute_error, wis, coverage_95, width_95) %>%
+  head(15) %>%
+  mutate(
+    absolute_error = round(absolute_error, 1),
+    wis = round(wis, 1),
+    coverage_95 = paste0(round(100 * coverage_95, 1), "%"),
+    width_95 = round(width_95, 1)
+  ) %>%
+  kable(caption = "Largest absolute errors across extended ARIMAX variants.")
+```
+
+## Final Model Ranking
+
+The ranking below prioritizes mean WIS because WIS evaluates the full
+probabilistic forecast: median accuracy, interval calibration, and interval
+sharpness are all rewarded or penalized. MAE is included as a secondary
+point-forecast check, and interval width is included because several improved
+models achieve better WIS by accepting wider uncertainty.
+
+```{r final-ranking-table}
+ranking_data <- comparison %>%
+  group_by(horizon) %>%
+  mutate(
+    wis_rank = rank(mean_wis, ties.method = "min"),
+    mae_rank = rank(mae, ties.method = "min"),
+    width_rank = rank(mean_width_95, ties.method = "min")
+  ) %>%
+  ungroup()
+
+overall_ranking <- ranking_data %>%
+  group_by(model) %>%
+  summarise(
+    mean_wis = mean(mean_wis),
+    mean_mae = mean(mae),
+    mean_coverage_95 = mean(coverage_95),
+    mean_width_95 = mean(mean_width_95),
+    average_wis_rank = mean(wis_rank),
+    average_mae_rank = mean(mae_rank),
+    .groups = "drop"
+  ) %>%
+  arrange(average_wis_rank, mean_wis)
+
+overall_ranking %>%
+  mutate(
+    final_rank = row_number(),
+    mean_wis = round(mean_wis, 1),
+    mean_mae = round(mean_mae, 1),
+    mean_coverage_95 = paste0(round(100 * mean_coverage_95, 1), "%"),
+    mean_width_95 = round(mean_width_95, 1),
+    average_wis_rank = round(average_wis_rank, 2),
+    average_mae_rank = round(average_mae_rank, 2)
+  ) %>%
+  select(final_rank, model, mean_wis, average_wis_rank, mean_mae,
+         average_mae_rank, mean_coverage_95, mean_width_95) %>%
+  kable(caption = "Overall model ranking. Lower WIS and lower rank values are better.")
+```
+
+```{r final-ranking-plot}
+ranking_plot <- ranking_data %>%
+  mutate(
+    horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week")),
+    model = factor(model, levels = overall_ranking$model)
+  ) %>%
+  ggplot(aes(x = model, y = mean_wis, fill = model)) +
+  geom_col(width = .65, show.legend = FALSE) +
+  geom_text(aes(label = paste0("#", wis_rank)), vjust = -.35, size = 3.4) +
+  facet_wrap(~horizon_label, scales = "free_y") +
+  labs(
+    x = NULL,
+    y = "Mean WIS",
+    title = "Model Ranking by Horizon",
+    subtitle = "Labels show WIS rank within each horizon; lower bars are better."
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ranking_plot
+```
+
+```{r model-strengths-weaknesses}
+model_notes <- tibble::tribble(
+  ~model, ~strengths, ~weaknesses, ~best_use,
+  "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA",
+  "Best overall WIS in this run; uses wastewater, NSSP, seasonal structure, and simpler baselines; reduces overreaction from standalone ARIMAX.",
+  "Intervals are wider than original ARIMA and Activity 5 ensemble; blend weights are fixed rather than learned from a larger validation set.",
+  "Best current production candidate when probabilistic accuracy is the priority.",
+  "Activity 5 ensemble",
+  "Stable, simple, and sharper than ARIMAX variants; improves over original ARIMA without adding external data dependency.",
+  "Does not use wastewater, NSSP, or seasonal timing information; loses ground to the blend on WIS at all horizons.",
+  "Good conservative fallback when external surveillance streams are unavailable.",
+  "Original ARIMA",
+  "Simplest reproducible baseline; narrow intervals; no dependence on external covariates.",
+  "Generally weaker WIS and MAE; cannot react to leading surveillance signals.",
+  "Baseline comparator and fallback model.",
+  "Calibrated blend",
+  "Higher empirical coverage than the uncalibrated blend; preserves blended median accuracy.",
+  "Calibration widens intervals substantially, which worsens WIS here despite better coverage.",
+  "Useful if under-coverage is more costly than reduced sharpness.",
+  "ARIMAX: surveillance + seasonal",
+  "Uses the richest information set; captures leading surveillance signals and epidemic timing; RMSE improves at longer horizons.",
+  "Median accuracy worsens after adding seasonal state features; intervals are wide; more sensitive to covariate noise and small-sample overfit.",
+  "Research candidate for further feature selection, not the best standalone final model here.",
+  "Calibrated ARIMAX",
+  "Improves coverage for the rich ARIMAX variant using only prior errors.",
+  "Keeps the weaker ARIMAX median and widens already-wide intervals, so WIS is not competitive.",
+  "Diagnostic model for uncertainty calibration, not preferred for final submission."
+)
+
+model_notes %>%
+  mutate(model = factor(model, levels = overall_ranking$model)) %>%
+  arrange(model) %>%
+  kable(caption = "Strengths, weaknesses, and recommended use for each model version.")
+```
+
+Based on this run, the uncalibrated blended model is the strongest overall
+candidate. It improves probabilistic accuracy without relying entirely on the
+more volatile seasonal ARIMAX. Rolling interval calibration is still useful as a
+diagnostic and for coverage-sensitive settings, but in this evaluation it made
+intervals too wide to improve WIS.

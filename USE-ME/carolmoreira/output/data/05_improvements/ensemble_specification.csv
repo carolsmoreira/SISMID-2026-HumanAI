@@ -1,0 +1,2 @@
+model,arima_weight,persistence_weight,persistence_definition,leakage_check
+ARIMA-persistence ensemble,0.75,0.25,Observed admissions at the forecast reference date,Only reference-date or earlier observations are used
