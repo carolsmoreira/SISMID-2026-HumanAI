@@ -1,0 +1,2 @@
+model,regressors,regressor_lag_weeks,leakage_rule,reference_dates,quantile_levels
+ARIMAX: surveillance + seasonal,NWSS National WVAL; NSSP smoothed influenza ED visit percentage; MMWR week sine/cosine; weeks since season start; lagged current-season cumulative admissions; lagged post-peak decline indicator,6,"For target week t, use covariates from t - 42 days; horizon 3 uses covariates no later than 21 days before the reference date.",34,23

@@ -1,0 +1,13 @@
+check,status,detail
+canonical_column_order,OK,"reference_date, target, horizon, target_end_date, location, output_type, output_type_id, value"
+date_columns_are_Date,OK,reference_date and target_end_date parsed as Date before writing
+target_dates_equal_reference_plus_horizon,OK,validated for every row
+full_23_quantile_ladder,OK,"0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.975, 0.99"
+nondecreasing_quantiles,OK,validated within every reference_date/horizon
+nonnegative_integer_values,OK,validated by integer and lower-bound checks
+horizons_are_1_2_3,OK,"exactly 1, 2, and 3"
+rows_per_reference_date,OK,69 rows per reference date: 3 horizons x 23 quantiles
+intervals_widen_with_horizon,OK,95% interval width h3 >= h2 >= h1 for every reference date
+one_submission_file_per_reference_date,OK,34 files written
+selected_by_lowest_mean_wis,OK,"Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA"
+causal_post_peak_feature,OK,"post_peak_decline uses peak_seen_before, then a six-week lag"

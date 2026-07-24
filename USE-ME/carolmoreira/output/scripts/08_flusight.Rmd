@@ -1,0 +1,253 @@
+---
+title: "Activity 8: FluSight-Compliant Final Forecast"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+This activity turns the best-performing forecast from the expanded modeling
+work into a FluSight-ready product. The workflow is deliberately conservative:
+it preserves the Activity 3 reference dates, horizons, target definition, and
+quantile format; uses only lagged surveillance signals; ranks candidate models
+with held-out weighted interval score (WIS); and validates the final submission
+files before they are written.
+
+```{r setup}
+knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
+
+find_project_dir <- function(start_dir = getwd()) {
+  candidates <- unique(c(
+    start_dir,
+    file.path(start_dir, "USE-ME", "carolmoreira"),
+    file.path(start_dir, ".."),
+    file.path(start_dir, "..", ".."),
+    file.path(start_dir, "..", "..", "..")
+  ))
+  candidates <- normalizePath(candidates, mustWork = FALSE)
+  candidates <- candidates[file.exists(file.path(candidates, "output/scripts/08_flusight.R"))]
+  if (!length(candidates)) stop("Could not locate USE-ME/carolmoreira.")
+  candidates[1]
+}
+
+project_dir <- find_project_dir()
+knitr::opts_knit$set(root.dir = project_dir)
+if (!isTRUE(getOption("knitr.in.progress"))) setwd(project_dir)
+cat("Working directory:", project_dir, "\n")
+```
+
+## Run The Workflow
+
+The script below is the reproducible source of truth for Activity 8. It rebuilds
+the ARIMAX candidates, blends them with the Activity 5 ensemble and original
+ARIMA forecast, selects the best model by held-out mean WIS, and writes the
+final FluSight files.
+
+```{r run-script}
+source("output/scripts/08_flusight.R")
+```
+
+## Load Outputs
+
+```{r packages}
+required <- c("readr", "dplyr", "tidyr", "ggplot2", "knitr")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Required R package(s) not installed: ", paste(missing, collapse = ", "))
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+```{r paths}
+truth_csv <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+inventory_csv <- "output/data/08_flusight/upstream_data_stream_inventory.csv"
+spec_csv <- "output/data/08_flusight/arimax_specification.csv"
+comparison_csv <- "output/data/08_flusight/arimax_model_comparison_by_horizon.csv"
+ranking_csv <- "output/data/08_flusight/flusight_model_ranking.csv"
+final_forecast_csv <- "output/data/08_flusight/flusight_final_forecasts.csv"
+submission_manifest_csv <- "output/data/08_flusight/final_flusight_submission_manifest.csv"
+compliance_audit_csv <- "output/data/08_flusight/flusight_compliance_audit.csv"
+
+stream_png <- "output/figures/08_flusight/surveillance_streams_overview.png"
+lag_png <- "output/figures/08_flusight/lagged_covariate_relationships.png"
+component_png <- "output/figures/08_flusight/blend_vs_component_medians.png"
+ranking_png <- "output/figures/08_flusight/flusight_model_ranking.png"
+final_forecast_png <- "output/figures/08_flusight/flusight_final_forecast_vs_observed.png"
+metric_png <- "output/figures/08_flusight/arimax_metric_comparison.png"
+calibration_png <- "output/figures/08_flusight/rolling_interval_calibration_multipliers.png"
+
+expected <- c(truth_csv, inventory_csv, spec_csv, comparison_csv, ranking_csv,
+              final_forecast_csv, submission_manifest_csv, compliance_audit_csv,
+              stream_png, lag_png, component_png, ranking_png, final_forecast_png,
+              metric_png, calibration_png)
+if (!all(file.exists(expected))) {
+  stop("Missing Activity 8 output(s): ", paste(expected[!file.exists(expected)], collapse = ", "))
+}
+```
+
+## Inputs And Leading Signals
+
+The final candidate set uses the cleaned national influenza hospitalization
+target plus two upstream national surveillance streams: NWSS wastewater viral
+activity level and NSSP smoothed influenza emergency-department visit percent.
+Both external signals are lagged six weeks before modeling, which makes them
+available before every 1-, 2-, and 3-week-ahead target date.
+
+```{r inventory}
+read_csv(inventory_csv, show_col_types = FALSE) %>%
+  kable(caption = "Input stream inventory and model role.")
+```
+
+```{r stream-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(stream_png)))
+```
+
+```{r lag-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(lag_png)))
+```
+
+## Model Specification
+
+The central ARIMAX candidate uses lagged NWSS WVAL, lagged NSSP influenza ED
+visits, deterministic MMWR timing features, lagged current-season cumulative
+admissions, and a lagged post-peak-decline flag. The post-peak feature is
+computed from the peak observed so far, then lagged, so it does not use the
+eventual full-season peak.
+
+```{r specification}
+read_csv(spec_csv, show_col_types = FALSE) %>%
+  kable(caption = "ARIMAX specification used inside the final candidate set.")
+```
+
+## Candidate Ranking
+
+The selected production forecast is the lowest mean WIS candidate across all
+scored reference dates and horizons. WIS is the primary ranking metric because
+it rewards both sharpness and calibration. MAE and RMSE are shown as supporting
+central-forecast diagnostics, while coverage and interval width describe
+uncertainty behavior.
+
+```{r ranking-table}
+ranking <- read_csv(ranking_csv, show_col_types = FALSE)
+best_model <- ranking$model[1]
+ranking %>%
+  mutate(across(c(mean_wis, mae, rmse, coverage_95, mean_width_95), round, 3)) %>%
+  kable(caption = "Overall model ranking. Lower WIS is better.")
+```
+
+```{r ranking-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(ranking_png)))
+```
+
+The final model selected by held-out mean WIS is:
+
+```{r best-model}
+cat(best_model)
+```
+
+## Horizon-Level Performance
+
+```{r comparison-table}
+comparison <- read_csv(comparison_csv, show_col_types = FALSE)
+comparison %>%
+  mutate(across(c(mae, rmse, mean_wis, coverage_95, mean_width_95), round, 3)) %>%
+  arrange(horizon, mean_wis) %>%
+  kable(caption = "Model comparison by forecast horizon.")
+```
+
+```{r metric-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(metric_png)))
+```
+
+```{r component-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(component_png)))
+```
+
+## Interval Calibration
+
+Rolling interval calibration was evaluated as an explicit candidate rather
+than assumed to be better. It improved coverage for some horizons but increased
+interval width substantially, so the final selection step allowed WIS to decide
+whether that tradeoff was worthwhile.
+
+```{r calibration-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(calibration_png)))
+```
+
+## Final Forecast
+
+The final forecast keeps the required FluSight long format: one row per
+reference date, target, horizon, location, output type, quantile level, and
+forecast value.
+
+```{r final-forecast-preview}
+final_fc <- read_csv(final_forecast_csv, show_col_types = FALSE)
+final_fc %>%
+  arrange(reference_date, horizon, output_type_id) %>%
+  head(12) %>%
+  kable(caption = "Preview of the final FluSight forecast file.")
+```
+
+```{r final-forecast-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(final_forecast_png)))
+```
+
+## FluSight Compliance Audit
+
+```{r compliance}
+read_csv(compliance_audit_csv, show_col_types = FALSE) %>%
+  kable(caption = "Automated compliance checks applied before final export.")
+```
+
+```{r submission-manifest}
+manifest <- read_csv(submission_manifest_csv, show_col_types = FALSE)
+manifest %>%
+  kable(caption = "Per-reference-date FluSight submission files.")
+```
+
+The output directory contains one validated file per reference date. Each file
+has 69 rows: 3 horizons times 23 quantiles.
+
+## Strengths And Weaknesses
+
+```{r strengths-weaknesses}
+model_notes <- tibble::tribble(
+  ~model, ~strengths, ~weaknesses,
+  "Original ARIMA",
+  "Simple, transparent, fully compliant, and hard to overfit.",
+  "Uses no wastewater, syndromic, or seasonal state signal; reacts after admissions move.",
+  "Activity 5 ensemble",
+  "Stable central forecasts and narrower intervals than ARIMAX-style models.",
+  "Does not directly use leading surveillance streams.",
+  "ARIMAX: surveillance + seasonal",
+  "Uses lagged upstream indicators and interpretable seasonal features.",
+  "Central errors improved less consistently than the blend; intervals can be wide.",
+  "Calibrated ARIMAX",
+  "Uses only prior forecast errors to adjust uncertainty and improves coverage.",
+  "Wider intervals can raise WIS when added coverage is not enough to compensate.",
+  "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA",
+  "Best overall WIS in this run; balances leading indicators with stable baseline behavior.",
+  "Still inherits some missed coverage from component intervals.",
+  "Calibrated blend",
+  "Most conservative blend-style uncertainty and better coverage.",
+  "Too wide for the WIS objective in this evaluation window."
+)
+
+model_notes %>%
+  kable(caption = "Qualitative interpretation of each model version.")
+```
+
+## Reproducibility Summary
+
+```{r reproducibility-summary}
+cat("Final forecast CSV:", final_forecast_csv, "\n")
+cat("Submission manifest:", submission_manifest_csv, "\n")
+cat("Submission directory: output/data/08_flusight/final_flusight_submission\n")
+cat("Selected model:", best_model, "\n")
+cat("Reference dates:", dplyr::n_distinct(final_fc$reference_date), "\n")
+cat("Rows in final forecast:", nrow(final_fc), "\n")
+```

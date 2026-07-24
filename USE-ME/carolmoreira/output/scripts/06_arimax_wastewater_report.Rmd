@@ -77,6 +77,8 @@ lag_grid_png <- "output/figures/06_arimax/arimax_lag_grid_progression.png"
 best_variant_png <- "output/figures/06_arimax/arimax_best_variant_by_horizon.png"
 calibration_png <- "output/figures/06_arimax/rolling_interval_calibration_multipliers.png"
 blend_png <- "output/figures/06_arimax/blend_vs_component_medians.png"
+leading_corr_png <- "output/figures/06_arimax/leading_indicator_correlations.png"
+leading_model_png <- "output/figures/06_arimax/leading_indicator_model_comparison.png"
 
 expected <- c(script_path, inventory_csv, spec_csv, comparison_csv, scores_csv,
               variant_scores_csv, variant_summary_csv,
@@ -130,6 +132,186 @@ spec %>% kable(caption = "ARIMAX specification.")
 ```{r lag-relationships, echo=FALSE, results='asis'}
 cat(sprintf('<img src="%s" width="100%%" />', lag_png_abs))
 ```
+
+## Leading Indicators Analysis
+
+Wastewater and syndromic surveillance are useful only if they provide
+information before hospital admissions move. This section checks that premise
+directly. For each candidate leading indicator, the analysis compares admissions
+at week `t` against indicator values from earlier weeks. A larger lag means the
+indicator is being asked to forecast farther ahead.
+
+```{r leading-indicator-data}
+# Re-load the raw target and candidate leading indicators here so this section
+# can be read independently from the later model-screening code.
+truth <- read_csv(truth_csv, show_col_types = FALSE) %>%
+  transmute(
+    week = as.Date(week),
+    location = as.character(location),
+    observed = as.numeric(value)
+  ) %>%
+  arrange(week)
+
+wval <- read_csv(wval_csv, show_col_types = FALSE) %>%
+  filter(`Pathogen Target` == "Influenza A virus") %>%
+  transmute(
+    week = as.Date(`Week End`, format = "%m/%d/%Y"),
+    wval = as.numeric(`National WVAL`)
+  ) %>%
+  distinct(week, .keep_all = TRUE) %>%
+  arrange(week)
+
+nssp <- read_csv(nssp_csv, show_col_types = FALSE) %>%
+  filter(geography == "United States") %>%
+  transmute(
+    week = as.Date(week_end, format = "%m/%d/%Y"),
+    nssp_flu = as.numeric(percent_visits_smoothed_influenza)
+  ) %>%
+  distinct(week, .keep_all = TRUE) %>%
+  arrange(week)
+
+wval_lookup <- setNames(wval$wval, as.character(wval$week))
+nssp_lookup <- setNames(nssp$nssp_flu, as.character(nssp$week))
+```
+
+```{r leading-indicator-correlations}
+# Correlate admissions at week t with indicators observed lag weeks earlier.
+# This is not a causal analysis; it is a timing diagnostic for whether the
+# stream contains useful leading signal.
+lag_candidates <- 0:8
+
+leading_indicator_correlations <- lapply(lag_candidates, function(lag_value) {
+  truth %>%
+    mutate(
+      wval_lagged = as.numeric(wval_lookup[as.character(week - 7 * lag_value)]),
+      nssp_lagged = as.numeric(nssp_lookup[as.character(week - 7 * lag_value)])
+    ) %>%
+    summarise(
+      lag_weeks = lag_value,
+      wval_correlation = cor(observed, wval_lagged, use = "complete.obs"),
+      nssp_correlation = cor(observed, nssp_lagged, use = "complete.obs"),
+      n_wval_weeks = sum(complete.cases(observed, wval_lagged)),
+      n_nssp_weeks = sum(complete.cases(observed, nssp_lagged))
+    )
+}) %>%
+  bind_rows() %>%
+  pivot_longer(c(wval_correlation, nssp_correlation),
+               names_to = "indicator", values_to = "correlation") %>%
+  mutate(indicator = recode(indicator,
+                            wval_correlation = "NWSS WVAL",
+                            nssp_correlation = "NSSP influenza"))
+
+best_indicator_lags <- leading_indicator_correlations %>%
+  group_by(indicator) %>%
+  slice_max(abs(correlation), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(indicator)
+
+leading_corr_plot <- ggplot(leading_indicator_correlations,
+                            aes(x = lag_weeks, y = correlation, color = indicator)) +
+  geom_hline(yintercept = 0, color = "grey65") +
+  geom_line(linewidth = .85) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("NWSS WVAL" = "#0072B2",
+                                "NSSP influenza" = "#D55E00")) +
+  labs(
+    x = "Indicator lag in weeks",
+    y = "Correlation with admissions",
+    color = "Leading indicator",
+    title = "Leading Indicator Timing",
+    subtitle = "Admissions at week t are compared with indicator values from t minus the lag."
+  ) +
+  theme_minimal()
+ggsave(leading_corr_png, leading_corr_plot, width = 10, height = 6, dpi = 300)
+
+best_indicator_lags %>%
+  mutate(correlation = round(correlation, 3)) %>%
+  kable(caption = "Strongest observed lag relationship for each leading indicator.")
+
+leading_corr_plot
+```
+
+```{r leading-indicator-model-use}
+# Explain how each model does or does not use the leading indicators. This
+# table is intentionally qualitative because some models use the signal directly
+# while others receive it only through blending.
+model_indicator_use <- tibble::tribble(
+  ~model, ~leading_indicator_use, ~interpretation,
+  "Original ARIMA",
+  "None",
+  "Uses only past admissions, so it cannot react directly to wastewater or syndromic changes before they appear in hospitalizations.",
+  "Activity 5 ensemble",
+  "None",
+  "Improves the baseline using persistence-style blending, but still does not ingest external surveillance signals.",
+  "ARIMAX: surveillance + seasonal",
+  "Direct",
+  "Uses WVAL and NSSP plus seasonal timing features. This gives the model the most leading signal, but also the most exposure to noise and overfit.",
+  "Calibrated ARIMAX",
+  "Direct plus interval calibration",
+  "Uses the same direct leading indicators as ARIMAX, then widens intervals from prior errors. Calibration changes uncertainty, not the median.",
+  "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA",
+  "Partial through blend",
+  "Carries leading indicator signal through the ARIMAX component while retaining stabilizing weight on simpler models.",
+  "Calibrated blend",
+  "Partial through blend plus interval calibration",
+  "Keeps the blended leading signal and adds rolling uncertainty calibration, trading sharpness for coverage."
+)
+
+model_indicator_use %>%
+  kable(caption = "How each Activity 6 model uses leading indicators.")
+```
+
+```{r leading-indicator-model-performance}
+# Summarize model performance by leading-indicator usage. If leading indicators
+# help, direct or partial-use models should improve WIS or MAE relative to
+# models that ignore them. The table keeps interval width visible because some
+# gains come with wider uncertainty.
+comparison_for_leads <- read_csv(comparison_csv, show_col_types = FALSE)
+
+leading_model_summary <- comparison_for_leads %>%
+  left_join(model_indicator_use, by = "model") %>%
+  group_by(model, leading_indicator_use) %>%
+  summarise(
+    average_wis = mean(mean_wis),
+    average_mae = mean(mae),
+    average_coverage_95 = mean(coverage_95),
+    average_width_95 = mean(mean_width_95),
+    .groups = "drop"
+  ) %>%
+  arrange(average_wis)
+
+leading_model_plot <- leading_model_summary %>%
+  mutate(model = factor(model, levels = model)) %>%
+  ggplot(aes(x = model, y = average_wis, fill = leading_indicator_use)) +
+  geom_col(width = .65) +
+  geom_text(aes(label = round(average_wis, 0)), vjust = -.35, size = 3.3) +
+  labs(
+    x = NULL,
+    y = "Average mean WIS across horizons",
+    fill = "Indicator use",
+    title = "Model Performance by Leading Indicator Use",
+    subtitle = "Lower WIS is better; partial use through blending performs best in this run."
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+ggsave(leading_model_png, leading_model_plot, width = 11, height = 6.5, dpi = 300)
+
+leading_model_summary %>%
+  mutate(
+    average_wis = round(average_wis, 1),
+    average_mae = round(average_mae, 1),
+    average_coverage_95 = paste0(round(100 * average_coverage_95, 1), "%"),
+    average_width_95 = round(average_width_95, 1)
+  ) %>%
+  kable(caption = "Average model performance grouped by leading-indicator use.")
+
+leading_model_plot
+```
+
+The leading-indicator result is nuanced. WVAL and NSSP contain useful timing
+information, but the standalone seasonal ARIMAX can overreact to that richer
+feature set. The blend performs best because it preserves some leading signal
+while anchoring the forecast to simpler, more stable models.
 
 ## Improvement Progression
 
