@@ -1,0 +1,251 @@
+---
+title: "Evaluating the Influenza Forecasts"
+subtitle: "Scoring FluSight forecasts against observed truth with scoringutils"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # show the code so students can read along
+  message = FALSE,    # hide package startup chatter
+  warning = FALSE     # keep the narrative clean; we validate explicitly below
+)
+```
+
+## What this script does, and why
+
+Every earlier step built toward a forecast; this one finally *grades* it. We take the quantile forecasts written in step 03 and the observed admissions from step 01, line each forecast up against what actually happened, and score it with proper scoring rules from the `scoringutils` package.
+
+Three numbers come out of it, one set per reference-date-and-horizon. The **weighted interval score (WIS)** rewards forecasts whose whole predictive distribution sits close to the truth, penalising both miscalibration and over-confidence. The **absolute error (AE)** of the median forecast is the plain "how far off was the point prediction." And **95% interval coverage** asks a yes/no question: did the 95% prediction interval actually contain the observed value? Averaged over many forecasts, that yes/no becomes a calibration rate you can compare against the nominal 95%.
+
+The script produces two tables: a detailed one with a row per reference-date × horizon, and a summary that averages the metrics by horizon so you can see how skill decays as the forecast reaches further into the future. As in the earlier steps, the section banners (`Rule 1`, `Rule 2`, …) mirror the project's `rules.md` specification.
+
+## Packages
+
+Three packages. `readr` and `dplyr` are familiar. The new one is `scoringutils`, the scoring engine: it knows how to take quantile forecasts plus observations and compute WIS, coverage, and the rest with the correct conventions, so we don't hand-roll those formulas. This script uses its v2 workflow, `as_forecast_quantile()` then `score()`.
+
+As before, the loop installs anything missing, and the `library()` calls are wrapped to keep the console quiet.
+
+```{r packages}
+pkgs <- c("readr", "dplyr", "scoringutils")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(scoringutils)
+})
+```
+
+## Paths and inputs
+
+This step is the first to read *two* pipeline products at once: the forecasts from step 03 and the cleaned truth from step 01. It writes two outputs of its own under `04_evaluation`. Because it depends on both upstream files, we confirm each exists before going further and stop with a clear message if either is missing.
+
+```{r paths}
+forecast_csv <- "output/data/03_forecast/flusight_forecasts.csv"
+cleaned_csv  <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
+scores_csv   <- "output/data/04_evaluation/forecast_scores.csv"
+summary_csv  <- "output/data/04_evaluation/forecast_scores_by_horizon.csv"
+
+dir.create(dirname(scores_csv), recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(forecast_csv)) stop(paste0("Missing input: ", forecast_csv))
+if (!file.exists(cleaned_csv))  stop(paste0("Missing input: ", cleaned_csv))
+```
+
+## Read the forecasts and the observed truth (Rule 1)
+
+We read the forecasts with an explicit column-type spec, since their structure is fixed and known: dates as dates, `horizon` as an integer, the quantile level and value as doubles. The truth is read as character and parsed deliberately, the same cautious habit as everywhere else, then reshaped.
+
+The key move is that last `transmute`: the truth's `week` becomes **`target_end_date`**. That renaming is what lets the truth join to the forecasts, because a forecast's `target_end_date` is exactly the week it is trying to predict. After this, each observed week is a single `(target_end_date, observed)` pair waiting to be matched.
+
+```{r read-inputs}
+# Forecasts: FluSight long format (one row per reference_date/horizon/quantile).
+fc_raw <- read_csv(
+  forecast_csv,
+  col_types = cols(
+    reference_date  = col_date(),
+    target          = col_character(),
+    horizon         = col_integer(),
+    target_end_date = col_date(),
+    location        = col_character(),
+    output_type     = col_character(),
+    output_type_id  = col_double(),
+    value           = col_double()
+  )
+)
+
+# Observed truth: week (Date), location (US), value (numeric).
+truth <- read_csv(cleaned_csv, col_types = cols(.default = "c"))
+if (!all(c("week", "location", "value") %in% names(truth))) {
+  stop("Required columns missing from cleaned CSV (expected week, location, value)")
+}
+truth$week  <- as.Date(truth$week)
+truth$value <- parse_number(truth$value)
+if (any(is.na(truth$week)))  stop("The week could not be parsed.")
+if (any(is.na(truth$value))) stop("The value could not be parsed.")
+truth <- truth %>%
+  transmute(target_end_date = week, observed = as.numeric(value))
+```
+
+## Align each forecast to what actually happened
+
+Now we match forecasts to observations on `target_end_date`. The script does this in two passes, and the reason is worth pausing on.
+
+First it takes the distinct reference-date/horizon/target combinations and `left_join`s the truth. A left join keeps *every* forecast target, filling in `NA` where no observation exists. That lets us count, honestly, how many targets can't be scored: any forecast whose target week lies beyond the last observed week has nothing to be graded against. Those get reported and dropped, not silently ignored.
+
+```{r align-count}
+# Join each forecast row to its observed target (target_end_date == week).
+# Keep only combinations whose target has an observed value; the later-horizon
+# targets beyond the last observed week cannot be scored.
+scorable_units <- fc_raw %>%
+  distinct(reference_date, horizon, target_end_date) %>%
+  left_join(truth, by = "target_end_date")
+
+n_total   <- nrow(scorable_units)
+n_dropped <- sum(is.na(scorable_units$observed))
+cat("Reference_date x horizon combinations:", n_total, "\n")
+cat("Dropped (no observed target):", n_dropped, "\n")
+cat("Scorable:", n_total - n_dropped, "\n")
+```
+
+> **Dropped forecasts aren't an error.** Near the end of the observed data, a reference date's 2- and 3-week-ahead targets may not have happened yet. Those rows legitimately have no truth to score against and fall away here. This is why the scored table can have fewer than three horizons for the most recent reference dates.
+
+The second pass is an `inner_join`, which keeps only the forecast rows that *do* have an observed target. Those are the rows we actually score. If nothing survives, there is nothing to evaluate and we stop.
+
+```{r align-join}
+joined <- fc_raw %>%
+  inner_join(truth, by = "target_end_date")
+if (nrow(joined) == 0) stop("No forecasts have an observed target to score against")
+```
+
+## Score with scoringutils (Rule 2)
+
+`scoringutils` wants the data in a specific long shape: one row per quantile, with columns named `observed`, `predicted`, and `quantile_level`, plus whatever columns identify a single forecast. The `transmute` below produces exactly that, renaming `value` to `predicted` and `output_type_id` to `quantile_level`, and tagging every row with `model = "arima"`.
+
+That column selection is doing quiet but important work. In `scoringutils`, the **forecast unit** — what counts as one forecast to be scored — is inferred from every column that *isn't* one of the reserved names (`observed`, `predicted`, `quantile_level`). By keeping only `reference_date`, `horizon`, `target_end_date`, `location`, and `model`, we pin the unit to reference-date × horizon. Any stray extra column left in here would silently split the unit and mis-group the scores.
+
+```{r su-input}
+# Shape into the long quantile format scoringutils expects. Keeping only these
+# columns makes the forecast unit exactly reference_date x horizon (plus the
+# shared target_end_date/location/model identifiers).
+su_input <- joined %>%
+  transmute(
+    reference_date,
+    horizon,
+    target_end_date,
+    location,
+    model          = "arima",
+    observed,
+    predicted      = value,
+    quantile_level = output_type_id
+  )
+
+fc_obj <- as_forecast_quantile(su_input)
+```
+
+Then we score. WIS and the absolute error of the median come straight from `scoringutils` as `wis` and `ae_median_quantile`. Coverage needs one extra step:
+
+> **95% coverage is not a default.** `score()`'s built-in coverage metrics for quantile forecasts are the 50% and 90% intervals, not 95%. To report the 95% interval we define a tiny wrapper around `interval_coverage(..., interval_range = 95)` and pass it in explicitly. Leave this out and the 95% coverage column simply won't appear.
+
+```{r score}
+# 95% interval coverage is not one of score()'s defaults; supply it explicitly
+# alongside WIS and the absolute error of the median forecast (AE).
+coverage_95 <- function(observed, predicted, quantile_level) {
+  interval_coverage(observed, predicted, quantile_level, interval_range = 95)
+}
+
+scored <- score(
+  fc_obj,
+  metrics = list(
+    wis         = wis,
+    ae_median   = ae_median_quantile,
+    coverage_95 = coverage_95
+  )
+) %>%
+  as.data.frame()
+```
+
+## Build the per-forecast score table (Rule 3)
+
+We attach the observed value back onto each scored forecast, relabel the metrics to the FluSight-style names (`WIS`, `AE`, `coverage_95`), round WIS and AE to one decimal, and sort. The result is one tidy row per reference-date × horizon.
+
+> **`coverage_95` here is a 0/1 flag, not a rate.** At the level of a single forecast, either the 95% interval contained the truth (1) or it didn't (0). It only becomes a *coverage rate* once we average across forecasts, which is what the summary does next. The same is true of `AE`: per forecast it's an absolute error; averaged, it becomes the MAE.
+
+```{r scores-table}
+# One row per reference_date x horizon: attach the observed value, rename to the
+# FluSight-style metric labels, sort, and round WIS/AE to one decimal.
+observed_lookup <- scorable_units %>%
+  filter(!is.na(observed)) %>%
+  select(reference_date, horizon, target_end_date, observed)
+
+scores_out <- scored %>%
+  left_join(observed_lookup, by = c("reference_date", "horizon", "target_end_date")) %>%
+  transmute(
+    reference_date,
+    horizon,
+    target_end_date,
+    observed,
+    WIS         = round(wis, 1),
+    AE          = round(ae_median, 1),
+    coverage_95 = as.integer(coverage_95)
+  ) %>%
+  arrange(reference_date, horizon)
+
+cat("\n--- Forecast scores (per reference_date x horizon) ---\n")
+print(scores_out, row.names = FALSE)
+
+write_csv(scores_out, scores_csv)
+if (!file.exists(scores_csv)) stop("Scores CSV not written")
+cat("\nWrote", nrow(scores_out), "rows to", scores_csv, "\n")
+```
+
+## Summarise by horizon (Rule 4)
+
+Finally we collapse the per-forecast table down by horizon, so each of the 1-, 2-, and 3-week-ahead leads gets one summary row. This is where the per-forecast quantities turn into the aggregate ones the field actually reports:
+
+-   **`MAE_mean`** is the mean of the per-forecast `AE` — that average *is* the mean absolute error.
+-   **`coverage_95_mean`** is the mean of the 0/1 coverage flags — that average *is* the empirical 95% coverage rate, which you can compare against the nominal 0.95.
+-   The **min/max** columns show the spread of WIS and AE across reference dates, so a good average isn't hiding a few terrible weeks.
+
+Reading down the horizons usually shows WIS and MAE growing with lead time: the further ahead you forecast, the harder it is.
+
+```{r summary-table}
+# Mean (and range) of the metrics across reference dates, grouped by horizon,
+# to show how skill changes with lead time. The mean of the per-forecast AE is
+# the mean absolute error (MAE); the mean of the 0/1 coverage_95 is the
+# empirical 95% coverage rate.
+summary_out <- scores_out %>%
+  group_by(horizon) %>%
+  summarise(
+    n                = n(),
+    WIS_mean         = round(mean(WIS), 1),
+    WIS_min          = round(min(WIS), 1),
+    WIS_max          = round(max(WIS), 1),
+    MAE_mean         = round(mean(AE), 1),
+    MAE_min          = round(min(AE), 1),
+    MAE_max          = round(max(AE), 1),
+    coverage_95_mean = round(mean(coverage_95), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(horizon)
+
+cat("\n--- Forecast scores summarized by horizon ---\n")
+print(summary_out, row.names = FALSE)
+
+write_csv(summary_out, summary_csv)
+if (!file.exists(summary_csv)) stop("Summary CSV not written")
+cat("\nWrote", nrow(summary_out), "rows to", summary_csv, "\n")
+```
+
+## Where this leads
+
+This is the end of the pipeline, and also its point: we started with a raw surveillance file and finished with a quantitative report card on our forecasts. WIS, MAE, and 95% coverage, broken out by horizon, are exactly the currency the FluSight collaboration uses to compare models. From here the natural next move is comparison — swap the ARIMA baseline for another model, rerun steps 03 and 04, and read these same tables side by side to see whether skill actually improved. The scoring is deliberately model-agnostic, so any forecast that comes in FluSight format can be dropped in and graded the same way.
