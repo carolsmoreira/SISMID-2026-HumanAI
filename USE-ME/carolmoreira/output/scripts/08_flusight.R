@@ -29,6 +29,7 @@ cleaned_csv <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
 baseline_forecast_csv <- "output/data/03_forecast/flusight_forecasts.csv"
 ensemble_forecast_csv <- "output/data/05_improvements/ensemble_flusight_forecasts.csv"
 xgboost_forecast_csv <- "output/data/07_xgboost/xgboost_flusight_forecasts.csv"
+xgboost_leading_forecast_csv <- "output/data/07_xgboost/xgboost_leading_flusight_forecasts.csv"
 wval_csv <- "data/NWSSWVALNational.csv"
 nssp_csv <- "data/NSSPNational.csv"
 historical_iterations_csv <- "data/time-series-all-historical-iterations.csv"
@@ -633,6 +634,27 @@ if (file.exists(xgboost_forecast_csv)) {
   forecast_tables[["xgboost"]] <- xgboost_fc
 }
 
+if (file.exists(xgboost_leading_forecast_csv)) {
+  xgboost_leading_fc <- read_csv(xgboost_leading_forecast_csv, show_col_types = FALSE) %>%
+    mutate(
+      reference_date = as.Date(reference_date),
+      target_end_date = as.Date(target_end_date),
+      horizon = as.integer(horizon),
+      location = as.character(location),
+      output_type_id = as.numeric(output_type_id),
+      value = as.numeric(value)
+    )
+  validate_flusight_quantiles(xgboost_leading_fc, "Activity 7 XGBoost + leading indicators", require_interval_widening = FALSE)
+  xgboost_leading_scored <- score_quantile_forecasts(
+    xgboost_leading_fc,
+    truth,
+    "Activity 7 XGBoost + leading indicators"
+  )
+  comparison_models <- c(comparison_models, list(xgboost_leading_scored$summary))
+  variant_score_tables <- c(variant_score_tables, list(xgboost_leading_scored$scores))
+  forecast_tables[["xgboost_leading"]] <- xgboost_leading_fc
+}
+
 if (file.exists(ensemble_forecast_csv)) {
   ensemble_fc <- read_csv(ensemble_forecast_csv, show_col_types = FALSE) %>%
     mutate(
@@ -724,6 +746,9 @@ forecast_by_model <- list(
 )
 if (exists("ensemble_fc")) forecast_by_model[["Activity 5 ensemble"]] <- ensemble_fc
 if (exists("xgboost_fc")) forecast_by_model[["Activity 7 XGBoost"]] <- xgboost_fc
+if (exists("xgboost_leading_fc")) {
+  forecast_by_model[["Activity 7 XGBoost + leading indicators"]] <- xgboost_leading_fc
+}
 if (exists("blended_fc")) forecast_by_model[["Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA"]] <- blended_fc
 if (exists("calibrated_blend")) forecast_by_model[["Calibrated blend"]] <- calibrated_blend$forecasts
 if (exists("xgboost_blend_fc")) {
@@ -864,6 +889,7 @@ if (exists("blended_fc")) {
     ensemble_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 5 ensemble"),
     baseline_fc %>% filter(output_type_id == .5) %>% mutate(model = "Original ARIMA"),
     if (exists("xgboost_fc")) xgboost_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 7 XGBoost"),
+    if (exists("xgboost_leading_fc")) xgboost_leading_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost + leading indicators"),
     if (exists("xgboost_blend_fc")) xgboost_blend_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost-weighted blend")
   ) %>%
     mutate(horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week")))
@@ -879,6 +905,7 @@ if (exists("blended_fc")) {
                                   "Activity 5 ensemble" = "#009E73",
                                   "Original ARIMA" = "#0072B2",
                                   "Activity 7 XGBoost" = "#E69F00",
+                                  "XGBoost + leading indicators" = "#D55E00",
                                   "XGBoost-weighted blend" = "#000000")) +
     labs(
       x = "Target week",
@@ -979,6 +1006,7 @@ comparison_plot <- ggplot(comparison_plot_data, aes(x = horizon_label, y = value
   scale_fill_manual(values = c("Original ARIMA" = "#0072B2",
                                "Activity 5 ensemble" = "#009E73",
                                "Activity 7 XGBoost" = "#E69F00",
+                               "Activity 7 XGBoost + leading indicators" = "#D55E00",
                                "ARIMAX: surveillance + seasonal" = "#D55E00",
                                "Calibrated ARIMAX" = "#E69F00",
                                "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA" = "#CC79A7",

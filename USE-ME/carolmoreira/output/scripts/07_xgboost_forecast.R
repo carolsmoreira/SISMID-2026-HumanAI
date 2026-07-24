@@ -4,7 +4,8 @@
 # seasons, uses the SAME expanding-window reference-date set over the 2025-26
 # testing season, and emits 1/2/3-week-ahead forecasts in FluSight long format
 # (23 quantiles x 3 horizons per reference date) -- but swaps auto.arima() for
-# XGBoost quantile regression and uses NO external regressor / leading indicator.
+# XGBoost quantile regression. It also fits a second XGBoost candidate that adds
+# lagged wastewater/NSSP leading indicators under the same no-look-ahead rules.
 #
 # Modeling choices (see rules.md "Forecasting with Gradient-Boosted Trees"):
 #   * Features (XGBoost has no built-in AR structure): four admissions lags as of
@@ -49,18 +50,27 @@ cleaned_csv   <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
 baseline_forecast_csv <- "output/data/03_forecast/flusight_forecasts.csv"
 activity5_forecast_csv <- "output/data/05_improvements/ensemble_flusight_forecasts.csv"
 activity8_forecast_csv <- "output/data/08_flusight/flusight_final_forecasts.csv"
+wval_csv <- "data/NWSSWVALNational.csv"
+nssp_csv <- "data/NSSPNational.csv"
 
 forecast_csv  <- "output/data/07_xgboost/xgboost_flusight_forecasts.csv"
+leading_forecast_csv <- "output/data/07_xgboost/xgboost_leading_flusight_forecasts.csv"
 scores_csv <- "output/data/07_xgboost/xgboost_forecast_scores.csv"
+leading_scores_csv <- "output/data/07_xgboost/xgboost_leading_forecast_scores.csv"
 summary_csv <- "output/data/07_xgboost/xgboost_summary_by_horizon.csv"
+leading_summary_csv <- "output/data/07_xgboost/xgboost_leading_summary_by_horizon.csv"
 comparison_csv <- "output/data/07_xgboost/xgboost_model_comparison_by_horizon.csv"
 spec_csv <- "output/data/07_xgboost/xgboost_specification.csv"
 diagnostics_csv <- "output/data/07_xgboost/xgboost_diagnostics.csv"
+leading_diagnostics_csv <- "output/data/07_xgboost/xgboost_leading_diagnostics.csv"
 
 forecast_png  <- "output/figures/07_xgboost/xgboost_forecast_vs_observed.png"
+leading_forecast_png <- "output/figures/07_xgboost/xgboost_leading_forecast_vs_observed.png"
 comparison_png <- "output/figures/07_xgboost/xgboost_metric_comparison.png"
 width_png <- "output/figures/07_xgboost/xgboost_interval_widths.png"
+leading_width_png <- "output/figures/07_xgboost/xgboost_leading_interval_widths.png"
 feature_png <- "output/figures/07_xgboost/xgboost_feature_overview.png"
+leading_feature_png <- "output/figures/07_xgboost/xgboost_leading_feature_overview.png"
 
 dir.create(dirname(forecast_csv), recursive = TRUE, showWarnings = FALSE)
 dir.create(dirname(forecast_png), recursive = TRUE, showWarnings = FALSE)
@@ -97,6 +107,43 @@ if (!all(df$location == "US")) stop("The location could not be parsed.")
 
 df <- df %>% select(week, location, value) %>% arrange(week)
 if (nrow(df) == 0) stop("Input has zero rows")
+
+read_wval <- function(path) {
+  if (!file.exists(path)) stop("Missing input: ", path)
+  raw <- read_csv(path, col_types = cols(.default = col_character()), show_col_types = FALSE)
+  needed <- c("Pathogen Target", "Week End", "National WVAL")
+  if (!all(needed %in% names(raw))) stop("Wastewater CSV missing required columns.")
+
+  raw %>%
+    filter(`Pathogen Target` == "Influenza A virus") %>%
+    transmute(
+      week = as.Date(`Week End`, format = "%m/%d/%Y"),
+      wval = parse_number(`National WVAL`)
+    ) %>%
+    distinct(week, .keep_all = TRUE) %>%
+    arrange(week)
+}
+
+read_nssp <- function(path) {
+  if (!file.exists(path)) stop("Missing input: ", path)
+  raw <- read_csv(path, col_types = cols(.default = col_character()), show_col_types = FALSE)
+  needed <- c("week_end", "geography", "percent_visits_smoothed_influenza")
+  if (!all(needed %in% names(raw))) stop("NSSP CSV missing required columns.")
+
+  raw %>%
+    filter(geography == "United States") %>%
+    transmute(
+      week = as.Date(week_end, format = "%m/%d/%Y"),
+      nssp_flu = parse_number(percent_visits_smoothed_influenza)
+    ) %>%
+    distinct(week, .keep_all = TRUE) %>%
+    arrange(week)
+}
+
+wval <- read_wval(wval_csv)
+nssp <- read_nssp(nssp_csv)
+if (anyNA(wval$week)) stop("Wastewater dates could not be parsed.")
+if (anyNA(nssp$week)) stop("NSSP dates could not be parsed.")
 
 # ---- Rule 2: Season Rules ----------------------------------------------------
 # Season spans MMWR week 40 -> week 20 of the following year; named YYYY-YY.
@@ -177,15 +224,20 @@ if (any(base_gaps != 7)) stop("Series weeks not evenly spaced at 7 days")
 # value lookup keyed by week for O(1) lag/target access.
 val_lookup <- setNames(df$value, as.character(df$week))
 val_at <- function(dates) unname(val_lookup[as.character(dates)])
+wval_lookup <- setNames(wval$wval, as.character(wval$week))
+nssp_lookup <- setNames(nssp$nssp_flu, as.character(nssp$week))
+wval_at <- function(dates) unname(wval_lookup[as.character(dates)])
+nssp_at <- function(dates) unname(nssp_lookup[as.character(dates)])
 
 SEASON_WEEKS <- 52.18  # MMWR year length for harmonic period
+LEADING_LAG_WEEKS <- 6L
 
 # epiweek lookup for seasonal harmonics of any calendar week.
 ew_of <- function(dates) MMWRweek(dates)$MMWRweek
 
 # Build the feature row(s) for a set of anchor weeks predicting target = anchor + 7h.
 # lags are values as of the anchor week; harmonics describe the target week.
-make_features <- function(anchor_weeks, h) {
+make_base_features <- function(anchor_weeks, h) {
   target_weeks <- anchor_weeks + 7 * h
   ew <- ew_of(target_weeks)
   data.frame(
@@ -199,10 +251,26 @@ make_features <- function(anchor_weeks, h) {
     cos2 = cos(2 * pi * 2 * ew / SEASON_WEEKS)
   )
 }
-FEATURE_NAMES <- c("lag1", "lag2", "lag3", "lag4", "sin1", "cos1", "sin2", "cos2")
+make_features <- make_base_features
+BASE_FEATURE_NAMES <- c("lag1", "lag2", "lag3", "lag4", "sin1", "cos1", "sin2", "cos2")
+
+make_leading_features <- function(anchor_weeks, h) {
+  target_weeks <- anchor_weeks + 7 * h
+  leading_weeks <- target_weeks - 7 * LEADING_LAG_WEEKS
+  cbind(
+    make_base_features(anchor_weeks, h),
+    data.frame(
+      wval_lag6 = wval_at(leading_weeks),
+      nssp_flu_lag6 = nssp_at(leading_weeks)
+    )
+  )
+}
+LEADING_FEATURE_NAMES <- c(BASE_FEATURE_NAMES, "wval_lag6", "nssp_flu_lag6")
+FEATURE_NAMES <- BASE_FEATURE_NAMES
 
 cat("\n--- Rule 1X validations (features) ---\n")
 cat("[val] feature names:", paste(FEATURE_NAMES, collapse = ", "), "\n")
+cat("[val] leading feature names:", paste(LEADING_FEATURE_NAMES, collapse = ", "), "\n")
 
 # ---- Rule 5 setup: coverage levels & quantile ladder -------------------------
 level_map <- data.frame(
@@ -233,95 +301,109 @@ set.seed(XGB_SEED)
 # ---- Rules 3X/4X/5X: fit per reference date x horizon, predict, reshape ------
 cat("\n--- Rule 4X & 5X validations ---\n")
 
-all_rows <- list()
-row_i <- 0
-diagnostic_rows <- list()
+fit_xgboost_variant <- function(model_label, make_features_fn, feature_names) {
+  all_rows <- list()
+  row_i <- 0
+  diagnostic_rows <- list()
 
-for (r in reference_dates) {
-  rd <- as.Date(r, origin = "1970-01-01")
+  for (r in reference_dates) {
+    rd <- as.Date(r, origin = "1970-01-01")
 
-  for (h in 1:3) {
-    target_end <- rd + 7 * h
+    for (h in 1:3) {
+      target_end <- rd + 7 * h
 
-    # Direct-h training set: anchor weeks t with complete features whose target
-    # t + 7h is observed AND t + 7h <= rd (no future leakage).
-    cand_anchor <- df$week[df$week <= rd]
-    feat_all    <- make_features(cand_anchor, h)
-    y_target    <- val_at(cand_anchor + 7 * h)
-    keep <- stats::complete.cases(feat_all) &
-            !is.na(y_target) &
-            (cand_anchor + 7 * h) <= rd
-    Xtr <- as.matrix(feat_all[keep, FEATURE_NAMES, drop = FALSE])
-    ytr <- y_target[keep]
+      # Direct-h training set: anchor weeks t with complete features whose target
+      # t + 7h is observed AND t + 7h <= rd (no future leakage).
+      cand_anchor <- df$week[df$week <= rd]
+      feat_all <- make_features_fn(cand_anchor, h)
+      y_target <- val_at(cand_anchor + 7 * h)
+      keep <- stats::complete.cases(feat_all) &
+              !is.na(y_target) &
+              (cand_anchor + 7 * h) <= rd
+      Xtr <- as.matrix(feat_all[keep, feature_names, drop = FALSE])
+      ytr <- y_target[keep]
 
-    if (anyNA(Xtr)) stop(paste0("Feature matrix has NA at ref ", format(rd, "%Y-%m-%d"), " h ", h))
-    if (nrow(Xtr) < 30) {
-      stop(paste0("Only ", nrow(Xtr), " training rows at ref ", format(rd, "%Y-%m-%d"),
-                  " horizon ", h, " (need >= 30)"))
-    }
-    if (!is.numeric(ytr) || any(is.na(ytr))) stop("Response not numeric / has NA")
-    if (any(ytr < 0)) stop("Response has negative values")
-    if (length(unique(ytr)) <= 1) stop(paste0("Response constant at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      if (anyNA(Xtr)) stop(paste0(model_label, ": feature matrix has NA at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      if (nrow(Xtr) < 30) {
+        stop(paste0(model_label, ": only ", nrow(Xtr), " training rows at ref ", format(rd, "%Y-%m-%d"),
+                    " horizon ", h, " (need >= 30)"))
+      }
+      if (!is.numeric(ytr) || any(is.na(ytr))) stop(model_label, ": response not numeric / has NA")
+      if (any(ytr < 0)) stop(model_label, ": response has negative values")
+      if (length(unique(ytr)) <= 1) stop(paste0(model_label, ": response constant at ref ", format(rd, "%Y-%m-%d"), " h ", h))
 
-    dtrain <- xgb.DMatrix(data = Xtr, label = ytr)
-    fit <- xgb.train(params = xgb_params, data = dtrain,
-                     nrounds = XGB_NROUND, verbose = 0)
-    if (is.null(fit)) stop(paste0("xgb.train returned NULL at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      dtrain <- xgb.DMatrix(data = Xtr, label = ytr)
+      fit <- xgb.train(params = xgb_params, data = dtrain,
+                       nrounds = XGB_NROUND, verbose = 0)
+      if (is.null(fit)) stop(paste0(model_label, ": xgb.train returned NULL at ref ", format(rd, "%Y-%m-%d"), " h ", h))
 
-    # Predict the 23 quantiles for the anchor = reference date.
-    Xpred <- as.matrix(make_features(rd, h)[, FEATURE_NAMES, drop = FALSE])
-    if (anyNA(Xpred)) stop(paste0("Prediction features NA at ref ", format(rd, "%Y-%m-%d"), " h ", h))
-    pred <- as.numeric(predict(fit, Xpred))
-    if (length(pred) != length(quantile_ladder)) {
-      stop(paste0("Expected ", length(quantile_ladder), " quantiles, got ", length(pred),
-                  " at ref ", format(rd, "%Y-%m-%d"), " h ", h))
-    }
-    if (any(!is.finite(pred))) stop(paste0("Non-finite prediction at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      # Predict the 23 quantiles for the anchor = reference date.
+      Xpred <- as.matrix(make_features_fn(rd, h)[, feature_names, drop = FALSE])
+      if (anyNA(Xpred)) stop(paste0(model_label, ": prediction features NA at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      pred <- as.numeric(predict(fit, Xpred))
+      if (length(pred) != length(quantile_ladder)) {
+        stop(paste0(model_label, ": expected ", length(quantile_ladder), " quantiles, got ", length(pred),
+                    " at ref ", format(rd, "%Y-%m-%d"), " h ", h))
+      }
+      if (any(!is.finite(pred))) stop(paste0(model_label, ": non-finite prediction at ref ", format(rd, "%Y-%m-%d"), " h ", h))
 
-    # Quantiles can cross -> sort ascending to enforce a non-decreasing ladder,
-    # then clamp at 0 and round to integer counts.
-    q_sorted <- sort(pred)
-    emit_vec <- round(pmax(q_sorted, 0))
+      # Quantiles can cross -> sort ascending to enforce a non-decreasing ladder,
+      # then clamp at 0 and round to integer counts.
+      q_sorted <- sort(pred)
+      emit_vec <- round(pmax(q_sorted, 0))
 
-    if (h == 1) {
-      cat("[val] ref", format(rd, "%Y-%m-%d"),
-          "| n_train(h1) =", nrow(Xtr),
-          "| 23 quantiles OK | features no-NA OK | fit OK\n")
-    }
-    diagnostic_rows[[length(diagnostic_rows) + 1]] <- data.frame(
-      reference_date = rd,
-      horizon = h,
-      n_training_rows = nrow(Xtr),
-      target_end_date = target_end,
-      min_training_target = min(cand_anchor[keep] + 7 * h),
-      max_training_target = max(cand_anchor[keep] + 7 * h),
-      nrounds = XGB_NROUND,
-      eta = xgb_params$eta,
-      max_depth = xgb_params$max_depth,
-      subsample = xgb_params$subsample,
-      colsample_bytree = xgb_params$colsample_bytree,
-      stringsAsFactors = FALSE
-    )
-
-    for (qi in seq_along(quantile_ladder)) {
-      row_i <- row_i + 1
-      all_rows[[row_i]] <- data.frame(
-        reference_date  = rd,
-        target          = "wk inc flu hosp",
-        horizon         = h,
+      if (h == 1) {
+        cat("[val]", model_label, "ref", format(rd, "%Y-%m-%d"),
+            "| n_train(h1) =", nrow(Xtr),
+            "| 23 quantiles OK | features no-NA OK | fit OK\n")
+      }
+      diagnostic_rows[[length(diagnostic_rows) + 1]] <- data.frame(
+        model = model_label,
+        reference_date = rd,
+        horizon = h,
+        n_training_rows = nrow(Xtr),
         target_end_date = target_end,
-        location        = "US",
-        output_type     = "quantile",
-        output_type_id  = quantile_ladder[qi],
-        value           = as.numeric(emit_vec[qi]),
+        min_training_target = min(cand_anchor[keep] + 7 * h),
+        max_training_target = max(cand_anchor[keep] + 7 * h),
+        nrounds = XGB_NROUND,
+        eta = xgb_params$eta,
+        max_depth = xgb_params$max_depth,
+        subsample = xgb_params$subsample,
+        colsample_bytree = xgb_params$colsample_bytree,
+        features = paste(feature_names, collapse = "; "),
         stringsAsFactors = FALSE
       )
+
+      for (qi in seq_along(quantile_ladder)) {
+        row_i <- row_i + 1
+        all_rows[[row_i]] <- data.frame(
+          reference_date  = rd,
+          target          = "wk inc flu hosp",
+          horizon         = h,
+          target_end_date = target_end,
+          location        = "US",
+          output_type     = "quantile",
+          output_type_id  = quantile_ladder[qi],
+          value           = as.numeric(emit_vec[qi]),
+          stringsAsFactors = FALSE
+        )
+      }
     }
   }
+
+  list(
+    forecasts = bind_rows(all_rows),
+    diagnostics = bind_rows(diagnostic_rows)
+  )
 }
 
-forecasts <- bind_rows(all_rows)
-diagnostics <- bind_rows(diagnostic_rows)
+base_variant <- fit_xgboost_variant("XGBoost quantile", make_base_features, BASE_FEATURE_NAMES)
+leading_variant <- fit_xgboost_variant("XGBoost + leading indicators", make_leading_features, LEADING_FEATURE_NAMES)
+
+forecasts <- base_variant$forecasts
+diagnostics <- base_variant$diagnostics
+leading_forecasts <- leading_variant$forecasts
+leading_diagnostics <- leading_variant$diagnostics
 
 # ---- Rule 5X validations -----------------------------------------------------
 cat("\n--- Rule 5X output validations ---\n")
@@ -374,6 +456,37 @@ widen_ok <- with(width_tbl, (h3 >= h2) & (h2 >= h1))
 cat(sprintf("[diag] intervals widen with horizon (h3>=h2>=h1): %d/%d reference dates (%.0f%%)\n",
             sum(widen_ok), length(widen_ok), 100 * mean(widen_ok)))
 
+validate_xgboost_output <- function(fc, model_label) {
+  if (any(fc$value < 0) || any(fc$value != round(fc$value))) {
+    stop(model_label, ": value entries must be non-negative integers")
+  }
+  nd_check <- fc %>%
+    arrange(reference_date, horizon, output_type_id) %>%
+    group_by(reference_date, horizon) %>%
+    summarise(ok = all(diff(value) >= 0), .groups = "drop")
+  if (!all(nd_check$ok)) stop(model_label, ": quantile ladder is not non-decreasing somewhere")
+
+  lvl_check <- fc %>%
+    group_by(reference_date, horizon) %>%
+    summarise(ok = setequal(output_type_id, quantile_ladder) &&
+                   length(output_type_id) == length(quantile_ladder),
+              .groups = "drop")
+  if (!all(lvl_check$ok)) stop(model_label, ": quantile level set mismatch")
+
+  horizon_check <- fc %>%
+    group_by(reference_date) %>%
+    summarise(ok = setequal(unique(horizon), c(1, 2, 3)), .groups = "drop")
+  if (!all(horizon_check$ok)) stop(model_label, ": each reference date must emit horizons 1, 2, 3")
+
+  if (any(fc$target_end_date != fc$reference_date + 7 * fc$horizon)) {
+    stop(model_label, ": target_end_date does not equal reference_date + 7 * horizon")
+  }
+  invisible(TRUE)
+}
+
+validate_xgboost_output(leading_forecasts, "XGBoost + leading indicators")
+cat("[val] leading-indicator XGBoost FluSight output checks: OK\n")
+
 # NOTE: the "median centered / quantiles symmetric" check is intentionally
 # omitted -- XGBoost quantile predictions are asymmetric by construction.
 
@@ -382,18 +495,27 @@ forecasts_out <- forecasts %>%
   arrange(reference_date, horizon, match(output_type_id, quantile_ladder)) %>%
   select(reference_date, target, horizon, target_end_date,
          location, output_type, output_type_id, value)
+leading_forecasts_out <- leading_forecasts %>%
+  arrange(reference_date, horizon, match(output_type_id, quantile_ladder)) %>%
+  select(reference_date, target, horizon, target_end_date,
+         location, output_type, output_type_id, value)
 
 write_csv(forecasts_out, forecast_csv)
+write_csv(leading_forecasts_out, leading_forecast_csv)
 write_csv(diagnostics, diagnostics_csv)
+write_csv(leading_diagnostics, leading_diagnostics_csv)
 if (!file.exists(forecast_csv)) stop("Forecast CSV not written")
+if (!file.exists(leading_forecast_csv)) stop("Leading-indicator forecast CSV not written")
 cat("\nWrote", nrow(forecasts_out), "rows to", forecast_csv,
+    "(", length(reference_dates), "reference dates x 69 rows )\n")
+cat("Wrote", nrow(leading_forecasts_out), "rows to", leading_forecast_csv,
     "(", length(reference_dates), "reference dates x 69 rows )\n")
 
 specification <- tibble::tibble(
-  model = "XGBoost quantile regression",
+  model = c("XGBoost quantile regression", "XGBoost quantile regression + leading indicators"),
   response = "weekly national influenza admissions",
-  external_regressors = "none",
-  features = paste(FEATURE_NAMES, collapse = "; "),
+  external_regressors = c("none", "NWSS WVAL and NSSP influenza ED visits lagged six weeks from target week"),
+  features = c(paste(BASE_FEATURE_NAMES, collapse = "; "), paste(LEADING_FEATURE_NAMES, collapse = "; ")),
   framing = "direct per horizon; three models per reference date",
   objective = "reg:quantileerror",
   quantile_levels = paste(quantile_ladder, collapse = ", "),
@@ -479,6 +601,62 @@ p <- ggplot() +
 ggsave(forecast_png, p, dpi = 300, width = 11, height = 6.5)
 if (!file.exists(forecast_png)) stop("Forecast figure not written")
 
+leading_med_df <- leading_forecasts %>%
+  filter(output_type_id == 0.5) %>%
+  transmute(target_end_date, horizon,
+            hlab = factor(paste0(horizon, " wk"), levels = horizon_levels),
+            value)
+
+leading_pi_df <- leading_forecasts %>%
+  filter(output_type_id %in% c(0.025, 0.975)) %>%
+  select(target_end_date, horizon, output_type_id, value) %>%
+  pivot_wider(names_from = output_type_id, values_from = value) %>%
+  transmute(target_end_date, horizon,
+            hlab = factor(paste0(horizon, " wk"), levels = horizon_levels),
+            lo = `0.025`, hi = `0.975`)
+
+leading_y_max <- max(c(observed_plot$value, leading_med_df$value, leading_pi_df$hi), na.rm = TRUE) + 10000
+leading_plot <- ggplot() +
+  geom_ribbon(data = leading_pi_df,
+              aes(x = target_end_date, ymin = lo, ymax = hi,
+                  fill = hlab, group = hlab),
+              alpha = 0.20) +
+  geom_line(data = observed_plot, aes(x = week, y = value, color = "Observed"),
+            linewidth = 0.9) +
+  geom_point(data = observed_plot, aes(x = week, y = value, color = "Observed"),
+             size = 1.6) +
+  geom_line(data = leading_med_df, aes(x = target_end_date, y = value, color = hlab, group = hlab),
+            linewidth = 0.9) +
+  geom_point(data = leading_med_df, aes(x = target_end_date, y = value, color = hlab),
+             size = 1.6) +
+  scale_color_manual(
+    name = "Series",
+    values = c("Observed" = "black", horizon_colors),
+    breaks = c("Observed", horizon_levels),
+    labels = c("Observed", "1 wk Forecast Median",
+               "2 wk Forecast Median", "3 wk Forecast Median")
+  ) +
+  scale_fill_manual(
+    name = "95% PI",
+    values = horizon_colors,
+    labels = c("1 wk 95% PI", "2 wk 95% PI", "3 wk 95% PI")
+  ) +
+  scale_x_date(breaks = x_breaks, date_labels = "%Y-%m-%d") +
+  coord_cartesian(ylim = c(0, leading_y_max)) +
+  labs(
+    x = "Week",
+    y = "Weekly Influenza Hospitalizations",
+    title = paste0("USA 1-, 2-, & 3-Week-Ahead Influenza Hospitalization Forecast, ",
+                   "XGBoost with Leading Indicators (2025-26 Season)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave(leading_forecast_png, leading_plot, dpi = 300, width = 11, height = 6.5)
+if (!file.exists(leading_forecast_png)) stop("Leading-indicator forecast figure not written")
+
 # ---- Activity 07 evaluation and comparison ----------------------------------
 score_quantile_forecasts <- function(fc, truth_df, model_name) {
   required_cols <- c("reference_date", "target", "horizon", "target_end_date",
@@ -545,10 +723,13 @@ score_quantile_forecasts <- function(fc, truth_df, model_name) {
 }
 
 xgb_scored <- score_quantile_forecasts(forecasts_out, df, "XGBoost quantile")
+xgb_leading_scored <- score_quantile_forecasts(leading_forecasts_out, df, "XGBoost + leading indicators")
 write_csv(xgb_scored$scores, scores_csv)
+write_csv(xgb_leading_scored$scores, leading_scores_csv)
 write_csv(xgb_scored$summary, summary_csv)
+write_csv(xgb_leading_scored$summary, leading_summary_csv)
 
-comparison_tables <- list(xgb_scored$summary)
+comparison_tables <- list(xgb_scored$summary, xgb_leading_scored$summary)
 if (file.exists(baseline_forecast_csv)) {
   baseline_fc <- read_csv(baseline_forecast_csv, show_col_types = FALSE)
   comparison_tables <- c(comparison_tables, list(score_quantile_forecasts(baseline_fc, df, "Original ARIMA")$summary))
@@ -559,7 +740,7 @@ if (file.exists(activity5_forecast_csv)) {
 }
 if (file.exists(activity8_forecast_csv)) {
   activity8_fc <- read_csv(activity8_forecast_csv, show_col_types = FALSE)
-  comparison_tables <- c(comparison_tables, list(score_quantile_forecasts(activity8_fc, df, "Activity 8 final blend")$summary))
+  comparison_tables <- c(comparison_tables, list(score_quantile_forecasts(activity8_fc, df, "Activity 8 current final")$summary))
 }
 
 comparison <- bind_rows(comparison_tables) %>%
@@ -581,9 +762,10 @@ comparison_plot <- ggplot(comparison_plot_data, aes(x = horizon_label, y = value
   geom_col(position = position_dodge(width = .75), width = .62) +
   facet_wrap(~metric, scales = "free_y", ncol = 2) +
   scale_fill_manual(values = c("XGBoost quantile" = "#E69F00",
+                               "XGBoost + leading indicators" = "#D55E00",
                                "Original ARIMA" = "#0072B2",
                                "Activity 5 ensemble" = "#009E73",
-                               "Activity 8 final blend" = "#CC79A7")) +
+                               "Activity 8 current final" = "#CC79A7")) +
   labs(
     x = "Forecast horizon",
     y = NULL,
@@ -608,6 +790,21 @@ width_plot <- xgb_scored$scores %>%
   ) +
   theme_minimal()
 ggsave(width_png, width_plot, width = 9, height = 5.5, dpi = 300)
+
+leading_width_plot <- xgb_leading_scored$scores %>%
+  mutate(horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week"))) %>%
+  ggplot(aes(x = horizon_label, y = width_95, fill = horizon_label)) +
+  geom_boxplot(alpha = .75, outlier.alpha = .55) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  scale_fill_manual(values = c("1 week" = "#0072B2", "2 week" = "#E69F00", "3 week" = "#009E73"), guide = "none") +
+  labs(
+    x = "Forecast horizon",
+    y = "95% prediction interval width",
+    title = "XGBoost + Leading Indicator Interval Widths by Horizon",
+    subtitle = "Boxes show IQR, whiskers show non-outlier range, and diamonds show means."
+  ) +
+  theme_minimal()
+ggsave(leading_width_png, leading_width_plot, width = 9, height = 5.5, dpi = 300)
 
 feature_data <- df %>%
   select(week, value) %>%
@@ -639,9 +836,43 @@ feature_plot <- ggplot(feature_data, aes(x = week, y = as.numeric(scale(value)),
   theme(legend.position = "none")
 ggsave(feature_png, feature_plot, width = 10, height = 8, dpi = 300)
 
+leading_feature_data <- df %>%
+  select(week, value) %>%
+  mutate(
+    lag1 = value,
+    lag2 = lag(value, 1),
+    lag3 = lag(value, 2),
+    lag4 = lag(value, 3),
+    epiweek = MMWRweek(week)$MMWRweek,
+    sin1 = sin(2 * pi * 1 * epiweek / SEASON_WEEKS),
+    cos1 = cos(2 * pi * 1 * epiweek / SEASON_WEEKS),
+    sin2 = sin(2 * pi * 2 * epiweek / SEASON_WEEKS),
+    cos2 = cos(2 * pi * 2 * epiweek / SEASON_WEEKS),
+    wval_lag6 = wval_at(week - 7 * LEADING_LAG_WEEKS),
+    nssp_flu_lag6 = nssp_at(week - 7 * LEADING_LAG_WEEKS)
+  ) %>%
+  select(week, all_of(LEADING_FEATURE_NAMES)) %>%
+  pivot_longer(-week, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value))
+
+leading_feature_plot <- ggplot(leading_feature_data, aes(x = week, y = as.numeric(scale(value)), color = feature)) +
+  geom_line(linewidth = .65) +
+  facet_wrap(~feature, scales = "free_y", ncol = 2) +
+  labs(
+    x = "Week",
+    y = "Standardized feature value",
+    title = "XGBoost + Leading Indicator Feature Overview",
+    subtitle = "Admissions lags, target-week seasonal harmonics, and six-week lagged WVAL/NSSP signals."
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave(leading_feature_png, leading_feature_plot, width = 10, height = 9, dpi = 300)
+
 expected_outputs <- c(forecast_csv, scores_csv, summary_csv, comparison_csv,
-                      spec_csv, diagnostics_csv, forecast_png, comparison_png,
-                      width_png, feature_png)
+                      spec_csv, diagnostics_csv, leading_forecast_csv,
+                      leading_scores_csv, leading_summary_csv, leading_diagnostics_csv,
+                      forecast_png, leading_forecast_png, comparison_png,
+                      width_png, leading_width_png, feature_png, leading_feature_png)
 if (!all(file.exists(expected_outputs))) {
   stop("One or more Activity 07 outputs were not written: ",
        paste(expected_outputs[!file.exists(expected_outputs)], collapse = ", "))
@@ -649,6 +880,7 @@ if (!all(file.exists(expected_outputs))) {
 
 cat("\nActivity 07 XGBoost complete.\n")
 cat("Forecast:", forecast_csv, "\n")
+cat("Leading-indicator forecast:", leading_forecast_csv, "\n")
 cat("Scores:", scores_csv, "\n")
 cat("Comparison:", comparison_csv, "\n")
 print(comparison)

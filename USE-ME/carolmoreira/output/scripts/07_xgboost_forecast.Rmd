@@ -7,15 +7,20 @@ output:
     number_sections: true
 ---
 
-Activity 07 tests an XGBoost quantile-regression alternative to the original
+Activity 07 tests XGBoost quantile-regression alternatives to the original
 ARIMA forecast. It keeps the same testing season, reference dates, horizons,
 target, location, and FluSight quantile ladder, but replaces `auto.arima()` with
 direct horizon-specific gradient-boosted trees.
 
-The model intentionally uses no wastewater, NSSP, or other leading indicators.
-Its inputs are lagged influenza admissions and deterministic target-week
-seasonal harmonics only. This makes it a clean machine-learning benchmark
-between the baseline ARIMA work and the later ARIMAX/blended models.
+Two XGBoost candidates are compared:
+
+- Admissions-only XGBoost: lagged influenza admissions plus target-week
+  seasonal harmonics.
+- XGBoost + leading indicators: the same features plus NWSS WVAL and NSSP
+  influenza ED visit signals lagged six weeks from the target week.
+
+The leading indicators are lagged so that every feature is available before the
+forecast reference date.
 
 ```{r setup}
 knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
@@ -65,20 +70,29 @@ library(knitr)
 
 ```{r paths}
 forecast_csv <- "output/data/07_xgboost/xgboost_flusight_forecasts.csv"
+leading_forecast_csv <- "output/data/07_xgboost/xgboost_leading_flusight_forecasts.csv"
 scores_csv <- "output/data/07_xgboost/xgboost_forecast_scores.csv"
+leading_scores_csv <- "output/data/07_xgboost/xgboost_leading_forecast_scores.csv"
 summary_csv <- "output/data/07_xgboost/xgboost_summary_by_horizon.csv"
+leading_summary_csv <- "output/data/07_xgboost/xgboost_leading_summary_by_horizon.csv"
 comparison_csv <- "output/data/07_xgboost/xgboost_model_comparison_by_horizon.csv"
 spec_csv <- "output/data/07_xgboost/xgboost_specification.csv"
 diagnostics_csv <- "output/data/07_xgboost/xgboost_diagnostics.csv"
+leading_diagnostics_csv <- "output/data/07_xgboost/xgboost_leading_diagnostics.csv"
 
 forecast_png <- "output/figures/07_xgboost/xgboost_forecast_vs_observed.png"
+leading_forecast_png <- "output/figures/07_xgboost/xgboost_leading_forecast_vs_observed.png"
 comparison_png <- "output/figures/07_xgboost/xgboost_metric_comparison.png"
 width_png <- "output/figures/07_xgboost/xgboost_interval_widths.png"
+leading_width_png <- "output/figures/07_xgboost/xgboost_leading_interval_widths.png"
 feature_png <- "output/figures/07_xgboost/xgboost_feature_overview.png"
+leading_feature_png <- "output/figures/07_xgboost/xgboost_leading_feature_overview.png"
 
 expected <- c(forecast_csv, scores_csv, summary_csv, comparison_csv,
-              spec_csv, diagnostics_csv, forecast_png, comparison_png,
-              width_png, feature_png)
+              spec_csv, diagnostics_csv, leading_forecast_csv,
+              leading_scores_csv, leading_summary_csv, leading_diagnostics_csv,
+              forecast_png, leading_forecast_png, comparison_png,
+              width_png, leading_width_png, feature_png, leading_feature_png)
 if (!all(file.exists(expected))) {
   stop("Missing Activity 07 output(s): ", paste(expected[!file.exists(expected)], collapse = ", "))
 }
@@ -88,8 +102,10 @@ if (!all(file.exists(expected))) {
 
 XGBoost has no built-in autoregressive time-series structure, so the weekly
 series is converted into a supervised learning table. For each reference date
-and horizon, the model uses the last four known admissions values plus first
-and second seasonal harmonics for the target MMWR week.
+and horizon, both candidates use the last four known admissions values plus
+first and second seasonal harmonics for the target MMWR week. The leading
+candidate additionally uses WVAL and NSSP values from six weeks before the
+target week.
 
 ```{r model-spec}
 read_csv(spec_csv, show_col_types = FALSE) %>%
@@ -98,6 +114,10 @@ read_csv(spec_csv, show_col_types = FALSE) %>%
 
 ```{r feature-plot, echo=FALSE, results='asis'}
 cat(sprintf('<img src="%s" width="100%%" />', normalizePath(feature_png)))
+```
+
+```{r leading-feature-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(leading_feature_png)))
 ```
 
 ## No-Look-Ahead Framing
@@ -109,10 +129,12 @@ features are known at forecast time.
 
 ```{r diagnostics}
 diagnostics <- read_csv(diagnostics_csv, show_col_types = FALSE)
-diagnostics %>%
+leading_diagnostics <- read_csv(leading_diagnostics_csv, show_col_types = FALSE)
+bind_rows(diagnostics, leading_diagnostics) %>%
   group_by(horizon) %>%
   summarise(
-    reference_dates = n(),
+    models = n_distinct(model),
+    reference_dates = n_distinct(reference_date),
     min_training_rows = min(n_training_rows),
     max_training_rows = max(n_training_rows),
     .groups = "drop"
@@ -134,16 +156,30 @@ forecasts %>%
   kable(caption = "Preview of the Activity 07 FluSight-format XGBoost forecast.")
 ```
 
+```{r leading-forecast-preview}
+leading_forecasts <- read_csv(leading_forecast_csv, show_col_types = FALSE)
+leading_forecasts %>%
+  arrange(reference_date, horizon, output_type_id) %>%
+  head(12) %>%
+  kable(caption = "Preview of the Activity 07 XGBoost + leading indicators forecast.")
+```
+
 ```{r forecast-plot, echo=FALSE, results='asis'}
 cat(sprintf('<img src="%s" width="100%%" />', normalizePath(forecast_png)))
+```
+
+```{r leading-forecast-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(leading_forecast_png)))
 ```
 
 ## XGBoost Performance
 
 ```{r summary-table}
 xgb_summary <- read_csv(summary_csv, show_col_types = FALSE)
-xgb_summary %>%
+xgb_leading_summary <- read_csv(leading_summary_csv, show_col_types = FALSE)
+bind_rows(xgb_summary, xgb_leading_summary) %>%
   mutate(across(c(mae, rmse, mean_wis, coverage_95, mean_width_95), round, 3)) %>%
+  arrange(horizon, mean_wis) %>%
   kable(caption = "XGBoost forecast performance by horizon.")
 ```
 
@@ -151,12 +187,16 @@ xgb_summary %>%
 cat(sprintf('<img src="%s" width="100%%" />', normalizePath(width_png)))
 ```
 
+```{r leading-width-plot, echo=FALSE, results='asis'}
+cat(sprintf('<img src="%s" width="100%%" />', normalizePath(leading_width_png)))
+```
+
 ## Comparison With Other Versions
 
-The comparison table includes the original ARIMA baseline, Activity 5 ensemble,
-and Activity 8 final blend when those outputs are available locally. XGBoost is
-not the best one-week model, but it performs strongly at two and three weeks
-ahead in this run.
+The comparison table includes both XGBoost candidates plus the original ARIMA
+baseline, Activity 5 ensemble, and Activity 8 final forecast when those outputs
+are available locally. In this run, adding leading indicators improved coverage
+but widened intervals enough to worsen WIS relative to admissions-only XGBoost.
 
 ```{r comparison-table}
 comparison <- read_csv(comparison_csv, show_col_types = FALSE)
@@ -174,10 +214,11 @@ cat(sprintf('<img src="%s" width="100%%" />', normalizePath(comparison_png)))
 
 XGBoost behaves differently from ARIMA-style models. It can learn nonlinear
 relationships between recent admissions, season timing, and future admissions,
-which helps at longer horizons here. The tradeoff is that it is less
-transparent, it does not guarantee horizon-wise interval widening, and its
-short-horizon forecast is less competitive than the blend and Activity 5
-ensemble.
+which helps at longer horizons here. Adding WVAL/NSSP did not improve WIS in
+this backtest, likely because the surveillance streams have a shorter aligned
+history and produced much wider intervals. This is still useful evidence: the
+leading signal is available, but it needs more careful regularization or a
+targeted ensemble before it should replace admissions-only XGBoost.
 
 ```{r strengths-weaknesses}
 tibble::tribble(
@@ -188,8 +229,10 @@ tibble::tribble(
   "Uses the exact same FluSight format and reference dates as the baseline.",
   "Strength",
   "Direct quantile regression allows asymmetric predictive distributions.",
+  "Strength",
+  "A leakage-safe WVAL/NSSP XGBoost variant is now tested directly.",
   "Weakness",
-  "No external leading indicators, so it cannot use wastewater or NSSP signal.",
+  "The leading-indicator variant widened intervals and worsened WIS in this run.",
   "Weakness",
   "Less interpretable than ARIMA or ARIMAX.",
   "Weakness",
@@ -202,9 +245,12 @@ tibble::tribble(
 
 ```{r reproducibility-summary}
 cat("Forecast CSV:", forecast_csv, "\n")
+cat("Leading forecast CSV:", leading_forecast_csv, "\n")
 cat("Scores CSV:", scores_csv, "\n")
+cat("Leading scores CSV:", leading_scores_csv, "\n")
 cat("Comparison CSV:", comparison_csv, "\n")
 cat("Rows in forecast:", nrow(forecasts), "\n")
+cat("Rows in leading forecast:", nrow(leading_forecasts), "\n")
 cat("Reference dates:", dplyr::n_distinct(forecasts$reference_date), "\n")
 cat("Rows per reference date:", nrow(forecasts) / dplyr::n_distinct(forecasts$reference_date), "\n")
 ```
