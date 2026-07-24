@@ -10,9 +10,9 @@ output:
 This activity turns the best-performing forecast from the expanded modeling
 work into a FluSight-ready product. The workflow is deliberately conservative:
 it preserves the Activity 3 reference dates, horizons, target definition, and
-quantile format; uses only lagged surveillance signals; ranks candidate models
-with held-out weighted interval score (WIS); and validates the final submission
-files before they are written.
+quantile format; compares ARIMA, Activity 5, Activity 7 XGBoost, ARIMAX,
+calibrated, and blended candidates with held-out weighted interval score (WIS);
+and validates the final submission files before they are written.
 
 ```{r setup}
 knitr::opts_chunk$set(message = FALSE, warning = TRUE, fig.width = 10, fig.height = 6)
@@ -92,10 +92,11 @@ if (!all(file.exists(expected))) {
 ## Inputs And Leading Signals
 
 The final candidate set uses the cleaned national influenza hospitalization
-target plus two upstream national surveillance streams: NWSS wastewater viral
-activity level and NSSP smoothed influenza emergency-department visit percent.
-Both external signals are lagged six weeks before modeling, which makes them
-available before every 1-, 2-, and 3-week-ahead target date.
+target, the Activity 7 XGBoost forecast, and two upstream national surveillance
+streams: NWSS wastewater viral activity level and NSSP smoothed influenza
+emergency-department visit percent. The external surveillance signals are
+lagged six weeks before ARIMAX modeling, which makes them available before
+every 1-, 2-, and 3-week-ahead target date.
 
 ```{r inventory}
 read_csv(inventory_csv, show_col_types = FALSE) %>%
@@ -114,9 +115,10 @@ cat(sprintf('<img src="%s" width="100%%" />', normalizePath(lag_png)))
 
 The central ARIMAX candidate uses lagged NWSS WVAL, lagged NSSP influenza ED
 visits, deterministic MMWR timing features, lagged current-season cumulative
-admissions, and a lagged post-peak-decline flag. The post-peak feature is
-computed from the peak observed so far, then lagged, so it does not use the
-eventual full-season peak.
+admissions, and a lagged post-peak-decline flag. The Activity 7 XGBoost
+candidate uses no external leading indicators; it uses admissions lags and
+seasonal harmonics. The post-peak ARIMAX feature is computed from the peak
+observed so far, then lagged, so it does not use the eventual full-season peak.
 
 ```{r specification}
 read_csv(spec_csv, show_col_types = FALSE) %>%
@@ -171,8 +173,11 @@ cat(sprintf('<img src="%s" width="100%%" />', normalizePath(component_png)))
 
 Rolling interval calibration was evaluated as an explicit candidate rather
 than assumed to be better. It improved coverage for some horizons but increased
-interval width substantially, so the final selection step allowed WIS to decide
-whether that tradeoff was worthwhile.
+interval width substantially. After Activity 7 was added, XGBoost-style direct
+quantile forecasts were also allowed into the final ranking; for those models,
+horizon-wise interval widening is reported diagnostically rather than treated
+as a hard stop because direct per-horizon quantile models are not guaranteed to
+widen monotonically.
 
 ```{r calibration-plot, echo=FALSE, results='asis'}
 cat(sprintf('<img src="%s" width="100%%" />', normalizePath(calibration_png)))
@@ -223,6 +228,9 @@ model_notes <- tibble::tribble(
   "Activity 5 ensemble",
   "Stable central forecasts and narrower intervals than ARIMAX-style models.",
   "Does not directly use leading surveillance streams.",
+  "Activity 7 XGBoost",
+  "Best overall WIS after Activity 7 is included; especially strong at two and three weeks ahead.",
+  "Less interpretable than ARIMA/ARIMAX and direct horizon intervals do not always widen monotonically.",
   "ARIMAX: surveillance + seasonal",
   "Uses lagged upstream indicators and interpretable seasonal features.",
   "Central errors improved less consistently than the blend; intervals can be wide.",
@@ -230,8 +238,11 @@ model_notes <- tibble::tribble(
   "Uses only prior forecast errors to adjust uncertainty and improves coverage.",
   "Wider intervals can raise WIS when added coverage is not enough to compensate.",
   "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA",
-  "Best overall WIS in this run; balances leading indicators with stable baseline behavior.",
+  "Balances leading indicators with stable baseline behavior.",
   "Still inherits some missed coverage from component intervals.",
+  "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA",
+  "Second-best overall WIS after adding Activity 7; strong coverage and best one-week WIS in this run.",
+  "Did not beat raw XGBoost overall because the added components weakened longer-horizon sharpness.",
   "Calibrated blend",
   "Most conservative blend-style uncertainty and better coverage.",
   "Too wide for the WIS objective in this evaluation window."

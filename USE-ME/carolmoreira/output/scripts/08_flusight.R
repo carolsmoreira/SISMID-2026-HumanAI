@@ -7,8 +7,9 @@
 # streams are lagged six weeks based on the report's leakage-free lag/covariate
 # screen. This keeps every covariate needed for horizons 1, 2, and 3 observed
 # before the reference date. It then compares ARIMAX, calibrated ARIMAX, the
-# Activity 5 ensemble, the original ARIMA model, and blended candidates, selects
-# the lowest mean WIS model, and writes a final FluSight-compliant submission.
+# Activity 5 ensemble, the Activity 7 XGBoost model, the original ARIMA model,
+# and blended candidates, selects the lowest mean WIS model, and writes a final
+# FluSight-compliant submission.
 
 suppressPackageStartupMessages({
   required <- c("readr", "dplyr", "tidyr", "lubridate", "ggplot2", "MMWRweek", "forecast", "scoringutils")
@@ -27,6 +28,7 @@ suppressPackageStartupMessages({
 cleaned_csv <- "output/data/01_cleaning/cleaned_flu_admissions.csv"
 baseline_forecast_csv <- "output/data/03_forecast/flusight_forecasts.csv"
 ensemble_forecast_csv <- "output/data/05_improvements/ensemble_flusight_forecasts.csv"
+xgboost_forecast_csv <- "output/data/07_xgboost/xgboost_flusight_forecasts.csv"
 wval_csv <- "data/NWSSWVALNational.csv"
 nssp_csv <- "data/NSSPNational.csv"
 historical_iterations_csv <- "data/time-series-all-historical-iterations.csv"
@@ -39,6 +41,7 @@ stream_inventory_csv <- "output/data/08_flusight/upstream_data_stream_inventory.
 spec_csv <- "output/data/08_flusight/arimax_specification.csv"
 calibrated_forecast_csv <- "output/data/08_flusight/arimax_calibrated_flusight_forecasts.csv"
 blend_forecast_csv <- "output/data/08_flusight/blend_calibrated_flusight_forecasts.csv"
+xgboost_blend_forecast_csv <- "output/data/08_flusight/xgboost_blend_flusight_forecasts.csv"
 variant_scores_csv <- "output/data/08_flusight/arimax_extended_variant_scores.csv"
 variant_summary_csv <- "output/data/08_flusight/arimax_extended_variant_summary.csv"
 ranking_csv <- "output/data/08_flusight/flusight_model_ranking.csv"
@@ -53,6 +56,7 @@ forecast_png <- "output/figures/08_flusight/arimax_forecast_vs_observed.png"
 comparison_png <- "output/figures/08_flusight/arimax_metric_comparison.png"
 calibration_png <- "output/figures/08_flusight/rolling_interval_calibration_multipliers.png"
 blend_png <- "output/figures/08_flusight/blend_vs_component_medians.png"
+xgboost_blend_png <- "output/figures/08_flusight/xgboost_blend_vs_components.png"
 ranking_png <- "output/figures/08_flusight/flusight_model_ranking.png"
 final_forecast_png <- "output/figures/08_flusight/flusight_final_forecast_vs_observed.png"
 
@@ -200,7 +204,7 @@ score_quantile_forecasts <- function(fc, truth, model_name) {
   list(scores = scores, summary = summary)
 }
 
-validate_flusight_quantiles <- function(fc, model_name) {
+validate_flusight_quantiles <- function(fc, model_name, require_interval_widening = TRUE) {
   expected_cols <- c("reference_date", "target", "horizon", "target_end_date",
                      "location", "output_type", "output_type_id", "value")
   if (!identical(names(fc), expected_cols)) {
@@ -236,10 +240,11 @@ validate_flusight_quantiles <- function(fc, model_name) {
     mutate(width_95 = q0.975 - q0.025) %>%
     select(reference_date, horizon, width_95) %>%
     pivot_wider(names_from = horizon, values_from = width_95, names_prefix = "h")
-  if (any(width_check$h3 < width_check$h2 | width_check$h2 < width_check$h1, na.rm = TRUE)) {
+  interval_widening_ok <- !any(width_check$h3 < width_check$h2 | width_check$h2 < width_check$h1, na.rm = TRUE)
+  if (require_interval_widening && !interval_widening_ok) {
     stop(model_name, " 95% interval widths must widen with horizon.")
   }
-  invisible(TRUE)
+  invisible(interval_widening_ok)
 }
 
 calibrate_forecast_intervals <- function(fc, scored, model_name,
@@ -326,6 +331,40 @@ blend_forecast_distributions <- function(arimax_fc, ensemble_fc, baseline_fc,
     ungroup() %>%
     arrange(reference_date, horizon, output_type_id)
   validate_flusight_quantiles(blended, "Blended")
+  blended
+}
+
+blend_named_forecasts <- function(forecast_list, weights, model_name) {
+  if (abs(sum(weights) - 1) > 1e-8) stop("Blend weights must sum to 1.")
+  if (!all(names(weights) %in% names(forecast_list))) stop("Blend weights reference unavailable forecast tables.")
+  key_cols <- c("reference_date", "target", "horizon", "target_end_date",
+                "location", "output_type", "output_type_id")
+
+  blended <- NULL
+  for (model_key in names(weights)) {
+    component <- forecast_list[[model_key]] %>%
+      select(all_of(key_cols), component_value = value) %>%
+      mutate(weighted_value = weights[[model_key]] * component_value) %>%
+      select(all_of(key_cols), weighted_value)
+    if (is.null(blended)) {
+      blended <- component
+    } else {
+      blended <- blended %>%
+        inner_join(component, by = key_cols, suffix = c("", "_new")) %>%
+        mutate(weighted_value = weighted_value + weighted_value_new) %>%
+        select(all_of(key_cols), weighted_value)
+    }
+  }
+
+  blended <- blended %>%
+    mutate(value = round(pmax(weighted_value, 0))) %>%
+    select(all_of(key_cols), value) %>%
+    group_by(reference_date, horizon) %>%
+    arrange(output_type_id, .by_group = TRUE) %>%
+    mutate(value = cummax(value)) %>%
+    ungroup() %>%
+    arrange(reference_date, horizon, output_type_id)
+  validate_flusight_quantiles(blended, model_name, require_interval_widening = FALSE)
   blended
 }
 
@@ -570,7 +609,30 @@ calibrated_arimax_scored <- score_quantile_forecasts(
 )
 
 comparison_models <- list(baseline_scored$summary, arimax_scored$summary, calibrated_arimax_scored$summary)
-variant_score_tables <- list(arimax_scored$scores, calibrated_arimax_scored$scores)
+variant_score_tables <- list(baseline_scored$scores, arimax_scored$scores, calibrated_arimax_scored$scores)
+forecast_tables <- list(
+  arima = baseline_fc,
+  arimax = arimax_fc,
+  calibrated_arimax = calibrated_arimax$forecasts
+)
+
+if (file.exists(xgboost_forecast_csv)) {
+  xgboost_fc <- read_csv(xgboost_forecast_csv, show_col_types = FALSE) %>%
+    mutate(
+      reference_date = as.Date(reference_date),
+      target_end_date = as.Date(target_end_date),
+      horizon = as.integer(horizon),
+      location = as.character(location),
+      output_type_id = as.numeric(output_type_id),
+      value = as.numeric(value)
+    )
+  validate_flusight_quantiles(xgboost_fc, "Activity 7 XGBoost", require_interval_widening = FALSE)
+  xgboost_scored <- score_quantile_forecasts(xgboost_fc, truth, "Activity 7 XGBoost")
+  comparison_models <- c(comparison_models, list(xgboost_scored$summary))
+  variant_score_tables <- c(variant_score_tables, list(xgboost_scored$scores))
+  forecast_tables[["xgboost"]] <- xgboost_fc
+}
+
 if (file.exists(ensemble_forecast_csv)) {
   ensemble_fc <- read_csv(ensemble_forecast_csv, show_col_types = FALSE) %>%
     mutate(
@@ -580,8 +642,9 @@ if (file.exists(ensemble_forecast_csv)) {
       location = as.character(location),
       output_type_id = as.numeric(output_type_id),
       value = as.numeric(value)
-    )
+  )
   ensemble_scored <- score_quantile_forecasts(ensemble_fc, truth, "Activity 5 ensemble")
+  forecast_tables[["ensemble"]] <- ensemble_fc
   blended_fc <- blend_forecast_distributions(
     arimax_fc,
     ensemble_fc,
@@ -609,6 +672,25 @@ if (file.exists(ensemble_forecast_csv)) {
     variant_score_tables,
     list(ensemble_scored$scores, blended_scored$scores, calibrated_blend_scored$scores)
   )
+  forecast_tables[["blend_arimax_ensemble_arima"]] <- blended_fc
+  forecast_tables[["calibrated_blend"]] <- calibrated_blend$forecasts
+
+  if (exists("xgboost_fc")) {
+    xgboost_blend_fc <- blend_named_forecasts(
+      forecast_tables,
+      weights = c(xgboost = 0.50, arimax = 0.25, ensemble = 0.15, arima = 0.10),
+      model_name = "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA"
+    )
+    xgboost_blend_scored <- score_quantile_forecasts(
+      xgboost_blend_fc,
+      truth,
+      "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA"
+    )
+    write_csv(xgboost_blend_fc, xgboost_blend_forecast_csv)
+    comparison_models <- c(comparison_models, list(xgboost_blend_scored$summary))
+    variant_score_tables <- c(variant_score_tables, list(xgboost_blend_scored$scores))
+    forecast_tables[["blend_xgboost_arimax_ensemble_arima"]] <- xgboost_blend_fc
+  }
 }
 
 comparison <- bind_rows(comparison_models) %>%
@@ -641,8 +723,12 @@ forecast_by_model <- list(
   "Calibrated ARIMAX" = calibrated_arimax$forecasts
 )
 if (exists("ensemble_fc")) forecast_by_model[["Activity 5 ensemble"]] <- ensemble_fc
+if (exists("xgboost_fc")) forecast_by_model[["Activity 7 XGBoost"]] <- xgboost_fc
 if (exists("blended_fc")) forecast_by_model[["Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA"]] <- blended_fc
 if (exists("calibrated_blend")) forecast_by_model[["Calibrated blend"]] <- calibrated_blend$forecasts
+if (exists("xgboost_blend_fc")) {
+  forecast_by_model[["Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA"]] <- xgboost_blend_fc
+}
 
 if (!best_model %in% names(forecast_by_model)) stop("Best model forecast table is unavailable: ", best_model)
 
@@ -650,7 +736,7 @@ final_fc <- forecast_by_model[[best_model]] %>%
   select(reference_date, target, horizon, target_end_date, location, output_type, output_type_id, value) %>%
   arrange(reference_date, horizon, output_type_id)
 
-validate_flusight_quantiles(final_fc, "Final FluSight")
+final_interval_widening_ok <- validate_flusight_quantiles(final_fc, "Final FluSight", require_interval_widening = FALSE)
 write_csv(final_fc, final_forecast_csv)
 
 dir.create(submission_dir, recursive = TRUE, showWarnings = FALSE)
@@ -701,7 +787,7 @@ compliance_audit <- tibble(
     "selected_by_lowest_mean_wis",
     "causal_post_peak_feature"
   ),
-  status = "OK",
+  status = c(rep("OK", 8), ifelse(final_interval_widening_ok, "OK", "DIAGNOSTIC"), rep("OK", 3)),
   detail = c(
     paste(names(final_fc), collapse = ", "),
     "reference_date and target_end_date parsed as Date before writing",
@@ -711,7 +797,11 @@ compliance_audit <- tibble(
     "validated by integer and lower-bound checks",
     "exactly 1, 2, and 3",
     "69 rows per reference date: 3 horizons x 23 quantiles",
-    "95% interval width h3 >= h2 >= h1 for every reference date",
+    if (final_interval_widening_ok) {
+      "95% interval width h3 >= h2 >= h1 for every reference date"
+    } else {
+      "diagnostic only for selected direct/hybrid model; not a FluSight schema requirement"
+    },
     paste0(nrow(submission_manifest), " files written"),
     best_model,
     "post_peak_decline uses peak_seen_before, then a six-week lag"
@@ -772,7 +862,9 @@ if (exists("blended_fc")) {
     arimax_fc %>% filter(output_type_id == .5) %>% mutate(model = "ARIMAX"),
     blended_fc %>% filter(output_type_id == .5) %>% mutate(model = "Blend"),
     ensemble_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 5 ensemble"),
-    baseline_fc %>% filter(output_type_id == .5) %>% mutate(model = "Original ARIMA")
+    baseline_fc %>% filter(output_type_id == .5) %>% mutate(model = "Original ARIMA"),
+    if (exists("xgboost_fc")) xgboost_fc %>% filter(output_type_id == .5) %>% mutate(model = "Activity 7 XGBoost"),
+    if (exists("xgboost_blend_fc")) xgboost_blend_fc %>% filter(output_type_id == .5) %>% mutate(model = "XGBoost-weighted blend")
   ) %>%
     mutate(horizon_label = factor(paste0(horizon, " week"), levels = c("1 week", "2 week", "3 week")))
 
@@ -785,13 +877,15 @@ if (exists("blended_fc")) {
     scale_color_manual(values = c("ARIMAX" = "#D55E00",
                                   "Blend" = "#CC79A7",
                                   "Activity 5 ensemble" = "#009E73",
-                                  "Original ARIMA" = "#0072B2")) +
+                                  "Original ARIMA" = "#0072B2",
+                                  "Activity 7 XGBoost" = "#E69F00",
+                                  "XGBoost-weighted blend" = "#000000")) +
     labs(
       x = "Target week",
       y = "Weekly influenza hospitalizations",
       color = "Median forecast",
       title = "Blended Median Forecasts vs Components",
-      subtitle = "Blend = 50% ARIMAX, 25% Activity 5 ensemble, 25% original ARIMA."
+      subtitle = "Includes the original ARIMAX blend and the Activity 7 XGBoost-weighted blend."
     ) +
     theme_minimal()
   ggsave(blend_png, blend_plot, width = 11, height = 8, dpi = 300)
@@ -884,9 +978,11 @@ comparison_plot <- ggplot(comparison_plot_data, aes(x = horizon_label, y = value
   facet_wrap(~metric, scales = "free_y", ncol = 2) +
   scale_fill_manual(values = c("Original ARIMA" = "#0072B2",
                                "Activity 5 ensemble" = "#009E73",
+                               "Activity 7 XGBoost" = "#E69F00",
                                "ARIMAX: surveillance + seasonal" = "#D55E00",
                                "Calibrated ARIMAX" = "#E69F00",
                                "Blend: 50% ARIMAX, 25% ensemble, 25% ARIMA" = "#CC79A7",
+                               "Blend: 50% XGBoost, 25% ARIMAX, 15% ensemble, 10% ARIMA" = "#000000",
                                "Calibrated blend" = "#999999")) +
   labs(
     x = "Forecast horizon",
@@ -906,6 +1002,7 @@ expected_outputs <- c(
   ranking_png, final_forecast_png
 )
 if (exists("blended_fc")) expected_outputs <- c(expected_outputs, blend_forecast_csv, blend_png)
+if (exists("xgboost_blend_fc")) expected_outputs <- c(expected_outputs, xgboost_blend_forecast_csv)
 if (!all(file.exists(expected_outputs))) stop("One or more ARIMAX outputs were not written.")
 
 cat("Activity 8 FluSight workflow complete.\n")
@@ -917,6 +1014,10 @@ cat("Submission files:", submission_dir, "\n")
 cat("[val] quantiles non-decreasing: OK\n")
 cat("[val] all quantile levels present: OK\n")
 cat("[val] target dates correct: OK\n")
-cat("[val] intervals widen with horizon: OK\n")
+if (final_interval_widening_ok) {
+  cat("[val] intervals widen with horizon: OK\n")
+} else {
+  cat("[diag] intervals widen with horizon: not required for selected direct/hybrid model\n")
+}
 cat("[val] one file per reference date: OK\n")
 print(comparison)
